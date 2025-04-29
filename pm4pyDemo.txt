@@ -13,6 +13,7 @@ from pm4py.objects.log.util import sampling
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
 
 # Set random seed for reproducibility
 np.random.seed(42)
@@ -71,44 +72,68 @@ log = log_converter.apply(event_log_df)
 # 2. Save the generated log to XES format
 xes_exporter.apply(log, "generated_log.xes")
 
-# 3. Perform process discovery using different algorithms
+# 3. Perform process discovery and textual visualization
 # Alpha Miner
 net, initial_marking, final_marking = alpha_miner.apply(log)
-gviz = pn_visualizer.apply(net, initial_marking, final_marking)
-pn_visualizer.view(gviz)
+
+# Textual representation of Petri net
+print("\nAlpha Miner Results:")
+print("Places:", [p.name for p in net.places])
+print("Transitions:", [t.name for t in net.transitions])
+print("Arcs:", [(a.source.name, a.target.name) for a in net.arcs])
 
 # Heuristics Miner
 heu_net = heuristics_miner.apply_heu(log)
-gviz_heu = pn_visualizer.apply(heu_net)
-pn_visualizer.view(gviz_heu)
+print("\nHeuristics Miner Results:")
+print("Nodes:", heu_net.nodes)
+print("Edges:", heu_net.edges)
 
 # Directly-Follows Graph
 dfg = dfg_discovery.apply(log)
-gviz_dfg = dfg_visualizer.apply(dfg, log=log, variant=dfg_visualizer.Variants.FREQUENCY)
-dfg_visualizer.view(gviz_dfg)
+print("\nDirectly-Follows Graph (Top 10 relations):")
+sorted_dfg = sorted(dfg.items(), key=lambda x: x[1], reverse=True)
+for (source, target), count in sorted_dfg[:10]:
+    print(f"{source} -> {target}: {count} times")
 
-# 4. Perform conformance checking
-# Replay fitness with token replay
+# 4. Create simple matplotlib visualizations
+# Activity frequency plot
+activities = [event['concept:name'] for case in log for event in case]
+activity_counts = pd.Series(activities).value_counts()
+
+plt.figure(figsize=(10, 5))
+activity_counts.plot(kind='bar')
+plt.title('Activity Frequency')
+plt.ylabel('Count')
+plt.tight_layout()
+plt.show()
+
+# Case duration histogram
+case_durations = []
+for case in log:
+    if len(case) > 0:
+        duration = (case[-1]['time:timestamp'] - case[0]['time:timestamp']).total_seconds() / 3600
+        case_durations.append(duration)
+
+plt.figure(figsize=(10, 5))
+plt.hist(case_durations, bins=20)
+plt.title('Case Duration Distribution (hours)')
+plt.xlabel('Duration (hours)')
+plt.ylabel('Number of Cases')
+plt.tight_layout()
+plt.show()
+
+# 5. Perform conformance checking
 replayed_traces = token_replay.apply(log, net, initial_marking, final_marking)
-
-# Calculate fitness
 fitness = sum(t['trace_fitness'] for t in replayed_traces) / len(replayed_traces)
-print(f"Replay fitness: {fitness:.2%}")
+print(f"\nReplay fitness: {fitness:.2%}")
 
-# 5. Log statistics and filtering
-# Case duration statistics
+# 6. Log statistics
 all_case_durations = case_statistics.get_all_case_durations(log, case_statistics.Parameters.TIMESTAMP_KEY)
 avg_duration = sum(all_case_durations) / len(all_case_durations)
 print(f"Average case duration: {avg_duration:.2f} hours")
 
-# Filter log to only include cases with duration < 24 hours
-filtered_log = [case for case in log if (case[-1]['time:timestamp'] - case[0]['time:timestamp']).total_seconds() / 3600 < 24]
-
-# Sample 50% of cases
-sampled_log = sampling.sample(log, n=len(log)//2)
-
-# 6. Additional analysis - variant analysis
+# Variant analysis
 variants = case_statistics.get_variant_statistics(log)
-print("\nProcess variants (paths) and their frequency:")
+print("\nTop 5 process variants (paths):")
 for variant in sorted(variants, key=lambda x: x['count'], reverse=True)[:5]:
     print(f"{variant['count']} cases: {' -> '.join(variant['variant'][0])}")
