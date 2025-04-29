@@ -1,4 +1,4 @@
-npx shadcn@latest add input button scroll-area tooltip avatar textarea
+npx shadcn@latest add input button scroll-area tooltip avatar textarea select
 
 rm -rf .next node_modules package-lock.json
 npm install
@@ -11,6 +11,9 @@ npm install react-markdown remark-gfm rehype-highlight
 
 npm install react-dropzone @types/react-dropzone
 
-npx shadcn@latest add select textarea
+
 
 npm install react-markdown remark-gfm rehype-highlight react-syntax-highlighter
+
+
+npm install @radix-ui/react-slot @radix-ui/react-input @radix-ui/react-textarea @radix-ui/react-select @radix-ui/react-avatar @radix-ui/react-tooltip @radix-ui/react-scroll-area
