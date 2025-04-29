@@ -1,0 +1,384 @@
+import os
+import uuid
+import re
+from typing import List, Optional
+from datetime import datetime
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.security import HTTPBearer
+from pydantic import BaseModel
+from google.cloud import aiplatform
+from google.api_core import retry
+import pdfplumber
+import docx
+from starlette.responses import JSONResponse
+
+# Initialize Vertex AI
+aiplatform.init(project="your-gcp-project", location="us-central1")
+model = aiplatform.GenerativeModel("gemini-pro")
+
+app = FastAPI()
+security = HTTPBearer()
+
+# Configuration
+UPLOAD_DIR = "uploads"
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+ALLOWED_EXTENSIONS = {'.pdf', '.docx', '.txt'}
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Models
+class FRRequest(BaseModel):
+    project_name: Optional[str] = None
+    description: Optional[str] = None
+    file_ids: List[str]
+
+class AIGeneratedContent(BaseModel):
+    project_name: str
+    description: str
+    draft_content: str
+
+class AsyncTaskResponse(BaseModel):
+    task_id: str
+    status_url: str
+
+# Task Store (in production use Redis or DB)
+task_store = {}
+
+# --- Helper Functions ---
+def sanitize_filename(filename: str) -> str:
+    """Sanitize filename to prevent path traversal"""
+    return re.sub(r'[^\w.-]', '_', os.path.basename(filename))
+
+def is_allowed_file(filename: str) -> bool:
+    """Check if file extension is allowed"""
+    return os.path.splitext(filename)[1].lower() in ALLOWED_EXTENSIONS
+
+async def safe_save_file(file: UploadFile) -> str:
+    """Securely save uploaded file with validation"""
+    if not is_allowed_file(file.filename):
+        raise ValueError(f"Unsupported file type: {file.filename}")
+    
+    file_id = str(uuid.uuid4())
+    file_path = os.path.join(UPLOAD_DIR, file_id)
+    
+    try:
+        contents = await file.read()
+        if len(contents) > MAX_FILE_SIZE:
+            raise ValueError(f"File size exceeds {MAX_FILE_SIZE} bytes limit")
+        
+        with open(file_path, "wb") as f:
+            f.write(contents)
+        return file_id
+    finally:
+        await file.close()
+
+def extract_text_from_file(file_path: str) -> str:
+    """Safely extract text from different file types"""
+    ext = os.path.splitext(file_path)[1].lower()
+    
+    try:
+        if ext == '.pdf':
+            with pdfplumber.open(file_path) as pdf:
+                return "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
+        elif ext == '.docx':
+            doc = docx.Document(file_path)
+            return "\n".join(para.text for para in doc.paragraphs)
+        elif ext == '.txt':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        return ""
+    except Exception as e:
+        raise ValueError(f"Error processing file: {str(e)}")
+
+@retry.Retry(
+    initial=1.0,
+    maximum=10.0,
+    multiplier=2.0,
+    deadline=60.0,
+)
+def generate_with_vertex(prompt: str) -> str:
+    """Retryable Vertex AI call"""
+    response = model.generate_content(prompt)
+    return response.text
+
+def parse_ai_response(text: str) -> dict:
+    """Parse AI response with enhanced error handling"""
+    try:
+        parts = re.split(r'\n(?=\d\.)', text.strip())
+        if len(parts) < 3:
+            raise ValueError("Unexpected AI response format")
+        
+        return {
+            "project_name": parts[0].replace("1. ", "").strip(),
+            "description": parts[1].replace("2. ", "").strip(),
+            "draft_content": "\n".join(parts[2:]).replace("3. ", "").strip()
+        }
+    except Exception as e:
+        raise ValueError(f"Failed to parse AI response: {str(e)}")
+
+# --- API Endpoints ---
+@app.post("/upload/")
+async def upload_file(file: UploadFile = File(...)):
+    """Secure file upload endpoint"""
+    try:
+        file_id = await safe_save_file(file)
+        return {"file_id": file_id}
+    except Exception as e:
+        raise HTTPException(400, detail=str(e))
+
+@app.post("/analyze-documents/")
+async def analyze_documents(
+    file_ids: List[str],
+    background_tasks: BackgroundTasks
+) -> AsyncTaskResponse:
+    """Async document analysis with Vertex AI"""
+    task_id = str(uuid.uuid4())
+    task_store[task_id] = {"status": "processing", "result": None}
+    
+    async def process_task():
+        try:
+            documents_text = []
+            for file_id in file_ids:
+                file_path = os.path.join(UPLOAD_DIR, file_id)
+                if not os.path.exists(file_path):
+                    continue
+                
+                try:
+                    text = extract_text_from_file(file_path)
+                    if text:
+                        documents_text.append(text)
+                except Exception as e:
+                    print(f"Error processing {file_id}: {str(e)}")
+            
+            if not documents_text:
+                task_store[task_id] = {
+                    "status": "failed",
+                    "error": "No extractable content found"
+                }
+                return
+            
+            prompt = f"""根据以下技术文档内容生成：
+1. 项目名称（英文驼峰格式）
+2. 简洁的项目描述（50-100字）
+3. 初步的功能需求大纲（Markdown格式，包含代码块示例）
+
+文档内容：
+{" ".join(documents_text)[:10000]}"""
+            
+            ai_response = generate_with_vertex(prompt)
+            result = parse_ai_response(ai_response)
+            
+            task_store[task_id] = {
+                "status": "completed",
+                "result": {
+                    "project_name": result["project_name"],
+                    "description": result["description"],
+                    "draft_content": result["draft_content"]
+                }
+            }
+        except Exception as e:
+            task_store[task_id] = {
+                "status": "failed",
+                "error": str(e)
+            }
+    
+    background_tasks.add_task(process_task)
+    return AsyncTaskResponse(
+        task_id=task_id,
+        status_url=f"/tasks/{task_id}"
+    )
+
+@app.get("/tasks/{task_id}")
+def get_task_status(task_id: str):
+    """Check async task status"""
+    task = task_store.get(task_id)
+    if not task:
+        raise HTTPException(404, detail="Task not found")
+    
+    if task["status"] == "completed":
+        return {
+            "status": "completed",
+            "result": task["result"]
+        }
+    elif task["status"] == "failed":
+        return {
+            "status": "failed",
+            "error": task.get("error", "Unknown error")
+        }
+    return {"status": "processing"}
+
+# --- Background Cleanup ---
+async def cleanup_old_files():
+    """Periodically clean up old uploads"""
+    for filename in os.listdir(UPLOAD_DIR):
+        file_path = os.path.join(UPLOAD_DIR, filename)
+        if os.path.getmtime(file_path) < datetime.now().timestamp() - 3600:  # 1 hour
+            try:
+                os.remove(file_path)
+            except:
+                pass
+
+@app.on_event("startup")
+async def startup_event():
+    import asyncio
+    async def run_cleanup():
+        while True:
+            await cleanup_old_files()
+            await asyncio.sleep(3600)  # Run hourly
+    
+    asyncio.create_task(run_cleanup())
+	
+	
+	=========================
+
+"use client"
+import { useState, useEffect } from 'react'
+import { Button } from '@/components/ui/button'
+import { useToast } from '@/components/ui/use-toast'
+
+export function DocumentAnalyzer() {
+  const [files, setFiles] = useState<File[]>([])
+  const [taskId, setTaskId] = useState<string | null>(null)
+  const [status, setStatus] = useState<'idle' | 'uploading' | 'processing' | 'completed' | 'failed'>('idle')
+  const [result, setResult] = useState<{ projectName: string; description: string; draft: string } | null>(null)
+  const { toast } = useToast()
+
+  const handleSubmit = async () => {
+    if (files.length === 0) return
+    
+    setStatus('uploading')
+    
+    try {
+      // 1. Upload files
+      const fileIds = await Promise.all(
+        files.map(async (file) => {
+          const formData = new FormData()
+          formData.append('file', file)
+          const res = await fetch('/api/upload', {
+            method: 'POST',
+            body: formData
+          })
+          if (!res.ok) throw new Error('Upload failed')
+          return (await res.json()).file_id
+        })
+      )
+
+      // 2. Start analysis task
+      setStatus('processing')
+      const taskRes = await fetch('/api/analyze-documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file_ids: fileIds })
+      })
+      
+      const { task_id } = await taskRes.json()
+      setTaskId(task_id)
+      
+    } catch (err) {
+      setStatus('failed')
+      toast({
+        title: "Error",
+        description: err.message,
+        variant: "destructive"
+      })
+    }
+  }
+
+  // 3. Poll for task status
+  useEffect(() => {
+    if (!taskId) return
+    
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/tasks/${taskId}`)
+        const data = await res.json()
+        
+        if (data.status === 'completed') {
+          clearInterval(interval)
+          setStatus('completed')
+          setResult({
+            projectName: data.result.project_name,
+            description: data.result.description,
+            draft: data.result.draft_content
+          })
+        } else if (data.status === 'failed') {
+          clearInterval(interval)
+          setStatus('failed')
+          toast({
+            title: "Analysis Failed",
+            description: data.error || 'Unknown error',
+            variant: "destructive"
+          })
+        }
+      } catch (err) {
+        clearInterval(interval)
+        setStatus('failed')
+      }
+    }, 2000) // Poll every 2 seconds
+    
+    return () => clearInterval(interval)
+  }, [taskId])
+
+  return (
+    <div className="space-y-6">
+      <div className="border rounded-lg p-4">
+        <input
+          type="file"
+          multiple
+          accept=".pdf,.docx,.txt"
+          onChange={(e) => setFiles(Array.from(e.target.files || []))}
+          className="block w-full text-sm text-muted-foreground
+            file:mr-4 file:py-2 file:px-4
+            file:rounded-md file:border-0
+            file:text-sm file:font-semibold
+            file:bg-primary file:text-primary-foreground
+            hover:file:bg-primary/90"
+        />
+        <p className="mt-2 text-xs text-muted-foreground">
+          Supported formats: PDF, DOCX, TXT (max 10MB each)
+        </p>
+      </div>
+
+      <Button
+        onClick={handleSubmit}
+        disabled={files.length === 0 || status !== 'idle'}
+      >
+        {status === 'idle' && 'Analyze Documents'}
+        {status === 'uploading' && 'Uploading...'}
+        {status === 'processing' && 'Generating with Vertex AI...'}
+        {status === 'completed' && 'Analysis Complete'}
+        {status === 'failed' && 'Retry Analysis'}
+      </Button>
+
+      {status === 'processing' && (
+        <div className="flex items-center gap-2 text-sm">
+          <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-primary"></div>
+          Processing documents...
+        </div>
+      )}
+
+      {result && (
+        <div className="mt-6 space-y-4">
+          <h3 className="text-xl font-bold">{result.projectName}</h3>
+          <p className="text-muted-foreground">{result.description}</p>
+          <div className="prose dark:prose-invert max-w-none border rounded-lg p-4 bg-muted/50">
+            <pre className="whitespace-pre-wrap">{result.draft}</pre>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+=================================
+prompt = """请严格按以下格式生成内容：
+1. 项目名称：<简洁的技术产品名称，使用英文驼峰命名>
+2. 项目描述：<50-100字的中文描述，说明核心功能和价值>
+3. 需求大纲：
+### 功能需求
+- <需求点1>
+- <需求点2>
+
+### 技术规范
+```<合适的编程语言>
+// 示例代码
+```"""
