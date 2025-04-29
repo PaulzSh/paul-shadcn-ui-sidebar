@@ -1,0 +1,114 @@
+from pm4py.objects.log.importer.xes import importer as xes_importer
+from pm4py.objects.log.exporter.xes import exporter as xes_exporter
+from pm4py.objects.log.util import dataframe_utils
+from pm4py.objects.conversion.log import converter as log_converter
+from pm4py.algo.discovery.alpha import algorithm as alpha_miner
+from pm4py.algo.discovery.heuristics import algorithm as heuristics_miner
+from pm4py.algo.discovery.dfg import algorithm as dfg_discovery
+from pm4py.visualization.petrinet import visualizer as pn_visualizer
+from pm4py.visualization.dfg import visualizer as dfg_visualizer
+from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
+from pm4py.statistics.traces.log import case_statistics
+from pm4py.objects.log.util import sampling
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+# Set random seed for reproducibility
+np.random.seed(42)
+
+# 1. Generate a synthetic event log
+def generate_synthetic_log(num_cases=100):
+    # Define process variants (3 different paths)
+    variants = [
+        ["Create Order", "Approve Order", "Prepare Item", "Ship Item", "Deliver Item"],
+        ["Create Order", "Approve Order", "Prepare Item", "Cancel Order"],
+        ["Create Order", "Reject Order"]
+    ]
+    variant_weights = [0.6, 0.3, 0.1]  # probabilities for each variant
+    
+    cases = []
+    case_id = 1000
+    
+    for _ in range(num_cases):
+        # Choose a variant based on weights
+        variant = np.random.choice(len(variants), p=variant_weights)
+        activities = variants[variant]
+        
+        # Generate timestamps
+        start_time = datetime.now() - timedelta(days=np.random.randint(1, 30))
+        timestamps = [start_time]
+        
+        for i in range(1, len(activities)):
+            # Add random duration between activities (1-8 hours)
+            timestamps.append(timestamps[i-1] + timedelta(hours=np.random.uniform(1, 8)))
+        
+        # Create events for this case
+        for i, (activity, timestamp) in enumerate(zip(activities, timestamps)):
+            cases.append({
+                "case:concept:name": f"Case_{case_id}",
+                "concept:name": activity,
+                "time:timestamp": timestamp,
+                "org:resource": np.random.choice(["User_1", "User_2", "User_3", "User_4"]),
+                "cost": np.random.uniform(10, 1000),
+                "duration": (timestamps[-1] - timestamps[0]).total_seconds() / 3600 if i == len(activities)-1 else 0
+            })
+        
+        case_id += 1
+    
+    # Create dataframe
+    df = pd.DataFrame(cases)
+    df = dataframe_utils.convert_timestamp_columns_in_df(df)
+    
+    return df
+
+# Generate the log
+event_log_df = generate_synthetic_log(200)
+
+# Convert to PM4Py log format
+log = log_converter.apply(event_log_df)
+
+# 2. Save the generated log to XES format
+xes_exporter.apply(log, "generated_log.xes")
+
+# 3. Perform process discovery using different algorithms
+# Alpha Miner
+net, initial_marking, final_marking = alpha_miner.apply(log)
+gviz = pn_visualizer.apply(net, initial_marking, final_marking)
+pn_visualizer.view(gviz)
+
+# Heuristics Miner
+heu_net = heuristics_miner.apply_heu(log)
+gviz_heu = pn_visualizer.apply(heu_net)
+pn_visualizer.view(gviz_heu)
+
+# Directly-Follows Graph
+dfg = dfg_discovery.apply(log)
+gviz_dfg = dfg_visualizer.apply(dfg, log=log, variant=dfg_visualizer.Variants.FREQUENCY)
+dfg_visualizer.view(gviz_dfg)
+
+# 4. Perform conformance checking
+# Replay fitness with token replay
+replayed_traces = token_replay.apply(log, net, initial_marking, final_marking)
+
+# Calculate fitness
+fitness = sum(t['trace_fitness'] for t in replayed_traces) / len(replayed_traces)
+print(f"Replay fitness: {fitness:.2%}")
+
+# 5. Log statistics and filtering
+# Case duration statistics
+all_case_durations = case_statistics.get_all_case_durations(log, case_statistics.Parameters.TIMESTAMP_KEY)
+avg_duration = sum(all_case_durations) / len(all_case_durations)
+print(f"Average case duration: {avg_duration:.2f} hours")
+
+# Filter log to only include cases with duration < 24 hours
+filtered_log = [case for case in log if (case[-1]['time:timestamp'] - case[0]['time:timestamp']).total_seconds() / 3600 < 24]
+
+# Sample 50% of cases
+sampled_log = sampling.sample(log, n=len(log)//2)
+
+# 6. Additional analysis - variant analysis
+variants = case_statistics.get_variant_statistics(log)
+print("\nProcess variants (paths) and their frequency:")
+for variant in sorted(variants, key=lambda x: x['count'], reverse=True)[:5]:
+    print(f"{variant['count']} cases: {' -> '.join(variant['variant'][0])}")
