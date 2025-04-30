@@ -1,0 +1,18 @@
+const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    
+    // For demo purposes - create mock FR data
+    const mockFRData = {
+      projectName: formData.projectName || "Demo Project",
+      description: formData.description || "Sample functional requirements",
+      priority: formData.priority,
+      generatedContent: `# Functional Requirements Document\n\n**Project:** ${formData.projectName || "Demo Project"}\n\n## Overview\n${formData.description || "Sample description"}\n\n## Requirements\n1. Sample requirement 1\n2. Sample requirement 2\n3. Sample requirement 3`,
+      sourceDocuments: files.map(file => file.name)
+    };
+
+    // Store in sessionStorage for the draft page
+    sessionStorage.setItem('frDraftData', JSON.stringify(mockFRData));
+    
+    // Navigate to draft page
+    router.push("/fr-generator/draft");
+  };
