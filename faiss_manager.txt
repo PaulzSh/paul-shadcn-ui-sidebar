@@ -1,52 +1,37 @@
-from typing import List, Union, Callable
-from langchain_community.vectorstores import FAISS
-from langchain.schema import Document
-from langchain.chains import RetrievalQA
-from embeddings.custom_embeddings import CustomEmbeddings
-from embeddings.adapters import FunctionAsEmbedding
-
-class FAISSManager:
-    def __init__(self, embeddings: Union[Embeddings, Callable]):
-        # 类型检查增强
-        if not (isinstance(embeddings, Embeddings) or callable(embeddings)):
-            raise TypeError(
-                f"需传入Embeddings实例或可调用对象，得到 {type(embeddings)}"
-                "\n提示：确认CustomEmbeddings继承自langchain.embeddings.base.Embeddings"
-            )
-        
-        if isinstance(embeddings, Embeddings):
-            self.embeddings = embeddings
-        else:
-            from embeddings.adapters import FunctionAsEmbedding
-            self.embeddings = FunctionAsEmbedding(embeddings)
-
-    def create_from_texts(self, texts: List[str], **kwargs):
-        """创建向量库并返回self以支持链式调用"""
-        self.vectorstore = FAISS.from_texts(
-            texts=texts,
-            embedding=self.embeddings.embed_documents,  # 统一接口调用
-            **kwargs
+def __init__(self, embeddings: Union['Embeddings', Callable]):
+    """
+    参数:
+        embeddings: 支持三种形式：
+        1. LangChain Embeddings实例
+        2. 普通嵌入函数
+        3. 自定义类（只要有embed_documents方法）
+    """
+    # 方法1：优先检查接口协议而非继承关系
+    if hasattr(embeddings, 'embed_documents') and callable(embeddings.embed_documents):
+        self.embeddings = embeddings
+    # 方法2：普通函数
+    elif callable(embeddings):
+        from embeddings.adapters import FunctionAsEmbedding
+        self.embeddings = FunctionAsEmbedding(embeddings)
+    else:
+        raise TypeError(
+            f"需实现embed_documents方法或为可调用对象，得到 {type(embeddings)}\n"
+            "有效类型：\n"
+            "1. LangChain Embeddings实例\n"
+            "2. 包含embed_documents方法的类\n"
+            "3. 普通嵌入函数(texts: List[str]) -> List[List[float]]"
         )
-        return self  # 允许链式调用
+    
+    # 强制验证
+    self._validate_embeddings()
 
-    def create_retriever(self, search_kwargs: dict = None) -> RetrievalQA:
-        """
-        创建检索器
-        参数:
-            search_kwargs: 传递给retriever的参数，如{"k": 3}
-        返回:
-            RetrievalQA实例
-        """
-        if not self.vectorstore:
-            raise ValueError("请先创建或加载向量库")
-        
-        return RetrievalQA.from_chain_type(
-            llm=None,  # 实际使用时需要传入LLM实例
-            chain_type="stuff",
-            retriever=self.vectorstore.as_retriever(
-                search_kwargs=search_kwargs or {"k": 3}
-            ),
-            return_source_documents=True
-        )
-
-    # 保留其他原有方法（save/load等）
+def _validate_embeddings(self):
+    """执行运行时验证"""
+    try:
+        test_result = self.embeddings.embed_documents(["test"])
+        if not (isinstance(test_result, list) and 
+                isinstance(test_result[0], list) and 
+                isinstance(test_result[0][0], (float, int))):
+            raise ValueError("嵌入函数必须返回List[List[float]]")
+    except Exception as e:
+        raise RuntimeError(f"嵌入验证失败: {str(e)}")
