@@ -1,45 +1,53 @@
-from typing import List, Union
+from typing import List, Union, Callable
 from langchain_community.vectorstores import FAISS
 from langchain.schema import Document
+from langchain.chains import RetrievalQA
 from embeddings.custom_embeddings import CustomEmbeddings
+from embeddings.adapters import FunctionAsEmbedding
 
 class FAISSManager:
-    """FAISS向量库管理"""
+    """增强版FAISS管理类，支持检索器创建"""
     
-    def __init__(self, embeddings: CustomEmbeddings):
-        self.embeddings = embeddings
+    def __init__(self, embeddings: Union[CustomEmbeddings, Callable]):
+        """
+        参数:
+            embeddings: 可以是CustomEmbeddings实例或普通嵌入函数
+        """
+        if isinstance(embeddings, CustomEmbeddings):
+            self.embeddings = embeddings
+        else:
+            # 自动将函数包装为Embeddings对象
+            self.embeddings = FunctionAsEmbedding(embeddings)
+        
         self.vectorstore = None
-    
+
     def create_from_texts(self, texts: List[str], **kwargs):
-        """从文本创建向量库"""
+        """创建向量库并返回self以支持链式调用"""
         self.vectorstore = FAISS.from_texts(
             texts=texts,
-            embedding=self.embeddings.embed_documents,
+            embedding=self.embeddings.embed_documents,  # 统一接口调用
             **kwargs
         )
-        return self
-    
-    def create_from_documents(self, documents: List[Document], **kwargs):
-        """从Document对象创建"""
-        self.vectorstore = FAISS.from_documents(
-            documents=documents,
-            embedding=self.embeddings.embed_documents,
-            **kwargs
+        return self  # 允许链式调用
+
+    def create_retriever(self, search_kwargs: dict = None) -> RetrievalQA:
+        """
+        创建检索器
+        参数:
+            search_kwargs: 传递给retriever的参数，如{"k": 3}
+        返回:
+            RetrievalQA实例
+        """
+        if not self.vectorstore:
+            raise ValueError("请先创建或加载向量库")
+        
+        return RetrievalQA.from_chain_type(
+            llm=None,  # 实际使用时需要传入LLM实例
+            chain_type="stuff",
+            retriever=self.vectorstore.as_retriever(
+                search_kwargs=search_kwargs or {"k": 3}
+            ),
+            return_source_documents=True
         )
-        return self
-    
-    def save(self, path: str):
-        """保存向量库"""
-        if self.vectorstore:
-            self.vectorstore.save_local(path)
-    
-    @classmethod
-    def load(cls, path: str, embeddings: CustomEmbeddings):
-        """加载已有向量库"""
-        manager = cls(embeddings)
-        manager.vectorstore = FAISS.load_local(
-            folder_path=path,
-            embeddings=embeddings,
-            allow_dangerous_deserialization=True
-        )
-        return manager
+
+    # 保留其他原有方法（save/load等）

@@ -2,13 +2,21 @@ from typing import Callable, List
 from langchain.embeddings.base import Embeddings
 
 class FunctionAsEmbedding(Embeddings):
-    """将普通函数转换为Embeddings对象"""
+    """增强版函数适配器，支持更多验证"""
     
     def __init__(self, embed_func: Callable[[List[str]], List[List[float]]]):
+        if not callable(embed_func):
+            raise TypeError("必须传入可调用对象")
         self.embed_func = embed_func
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """添加输入验证"""
+        if not all(isinstance(t, str) for t in texts):
+            raise ValueError("输入必须全部是字符串")
         return self.embed_func(texts)
     
     def embed_query(self, text: str) -> List[float]:
-        return self.embed_func([text])[0]
+        """查询嵌入"""
+        if not isinstance(text, str):
+            raise ValueError("输入必须是字符串")
+        return self.embed_documents([text])[0]
