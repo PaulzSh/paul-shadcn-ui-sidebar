@@ -1,0 +1,38 @@
+from typing import Callable, List, Union
+import traceback
+
+class DocumentProcessor:
+    def __get_embedding_function(self) -> Callable[[Union[str, List[str]]], Union[List[float], List[List[float]]]:
+        """
+        获取嵌入函数，支持单个字符串或字符串列表输入
+        返回类型:
+            Callable: 可接收str或List[str]的函数
+                     返回List[float]或List[List[float]]
+        """
+        embedding_model = self.connector.get_embedding_model()
+
+        def embed_text(text: Union[str, List[str]]) -> Union[List[float], List[List[float]]]:
+            """
+            实际执行文本嵌入的函数
+            参数:
+                text: 单个字符串或字符串列表
+            返回:
+                单个文本的嵌入向量或文本列表的嵌入向量列表
+            """
+            try:
+                if isinstance(text, str):
+                    # 单个字符串输入
+                    embeddings = embedding_model.get_embeddings([text])
+                    return embeddings[0].values  # type: ignore
+                elif isinstance(text, list):
+                    # 字符串列表输入
+                    embeddings = embedding_model.get_embeddings(text)
+                    return [embedding.values for embedding in embeddings]  # type: ignore
+                else:
+                    raise TypeError(f"不支持的输入类型: {type(text)}，应为str或List[str]")
+            except Exception as e:
+                print(f"嵌入过程中发生错误: {e}")
+                print(traceback.format_exc())
+                raise
+
+        return embed_text
