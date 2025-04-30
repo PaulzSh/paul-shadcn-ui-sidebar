@@ -1,38 +1,32 @@
-def embed_documents(self, texts: List[str]) -> List[List[float]]:
-    """Fixed implementation with proper response parsing"""
-    try:
-        # Get raw response from VertexAI
-        prediction_response = self.model.get_embeddings(texts)
-        self._debug_response(response)  # Log raw response
+from typing import List, Union
+import numpy as np
+from google.cloud.aiplatform import TextEmbedding  # Import the actual class
 
-        # Parse response based on actual return type
-        if hasattr(prediction_response, 'predictions'):  # Handle VertexAI response object
-            return [
-                self._parse_vertex_response(prediction, i)
-                for i, prediction in enumerate(prediction_response.predictions)
-            ]
-        elif isinstance(prediction_response, list):  # Handle direct list
-            return self._ensure_float_vectors(prediction_response)
-        else:
-            raise ValueError(f"Unexpected response type: {type(prediction_response)}")
+class CustomEmbeddings(Embeddings):
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Handle TextEmbedding object responses"""
+        try:
+            # 1. Get TextEmbedding objects from VertexAI
+            text_embeddings = self.model.get_embeddings(texts)
             
-    except Exception as e:
-        logger.error(f"Embedding failed: {str(e)}")
-        raise
+            # 2. Extract vectors from TextEmbedding objects
+            vectors = []
+            for embedding_obj in text_embeddings:
+                if hasattr(embedding_obj, 'values'):
+                    # For newer VertexAI versions
+                    vectors.append([float(x) for x in embedding_obj.values])
+                elif hasattr(embedding_obj, 'embedding'):
+                    # For older versions
+                    vectors.append([float(x) for x in embedding_obj.embedding])
+                else:
+                    raise ValueError(f"Unknown TextEmbedding format: {dir(embedding_obj)}")
+            
+            return vectors
+            
+        except Exception as e:
+            print(f"Error in embed_documents: {str(e)}")
+            raise
 
-@staticmethod
-def _parse_vertex_response(prediction, index: int) -> List[float]:
-    """Handle VertexAI TextEmbedding response objects"""
-    if hasattr(prediction, 'values'):
-        return [float(x) for x in prediction.values]
-    elif hasattr(prediction, 'embedding'):
-        return [float(x) for x in prediction.embedding]
-    raise ValueError(f"Unsupported prediction format at index {index}")
-	
-def _debug_response(self, response):
-    """Log raw response structure for debugging"""
-    logger.debug(f"Response type: {type(response)}")
-    if hasattr(response, '__dict__'):
-        logger.debug(f"Response attributes: {vars(response)}")
-    elif isinstance(response, (list, np.ndarray)):
-        logger.debug(f"First item type: {type(response[0])}")
+    def embed_query(self, text: str) -> List[float]:
+        """Single text embedding"""
+        return self.embed_documents([text])[0]
