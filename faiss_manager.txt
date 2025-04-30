@@ -1,0 +1,45 @@
+from typing import List, Union
+from langchain_community.vectorstores import FAISS
+from langchain.schema import Document
+from embeddings.custom_embeddings import CustomEmbeddings
+
+class FAISSManager:
+    """FAISS向量库管理"""
+    
+    def __init__(self, embeddings: CustomEmbeddings):
+        self.embeddings = embeddings
+        self.vectorstore = None
+    
+    def create_from_texts(self, texts: List[str], **kwargs):
+        """从文本创建向量库"""
+        self.vectorstore = FAISS.from_texts(
+            texts=texts,
+            embedding=self.embeddings.embed_documents,
+            **kwargs
+        )
+        return self
+    
+    def create_from_documents(self, documents: List[Document], **kwargs):
+        """从Document对象创建"""
+        self.vectorstore = FAISS.from_documents(
+            documents=documents,
+            embedding=self.embeddings.embed_documents,
+            **kwargs
+        )
+        return self
+    
+    def save(self, path: str):
+        """保存向量库"""
+        if self.vectorstore:
+            self.vectorstore.save_local(path)
+    
+    @classmethod
+    def load(cls, path: str, embeddings: CustomEmbeddings):
+        """加载已有向量库"""
+        manager = cls(embeddings)
+        manager.vectorstore = FAISS.load_local(
+            folder_path=path,
+            embeddings=embeddings,
+            allow_dangerous_deserialization=True
+        )
+        return manager

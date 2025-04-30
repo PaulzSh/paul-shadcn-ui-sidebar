@@ -1,0 +1,14 @@
+from typing import Callable, List
+from langchain.embeddings.base import Embeddings
+
+class FunctionAsEmbedding(Embeddings):
+    """将普通函数转换为Embeddings对象"""
+    
+    def __init__(self, embed_func: Callable[[List[str]], List[List[float]]]):
+        self.embed_func = embed_func
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return self.embed_func(texts)
+    
+    def embed_query(self, text: str) -> List[float]:
+        return self.embed_func([text])[0]
