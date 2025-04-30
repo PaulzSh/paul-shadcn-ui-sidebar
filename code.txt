@@ -1,174 +1,77 @@
-"use client";
-import { useRouter } from "next/navigation";
-import { useState } from "react";
-import { Button } from "@/components/ui/button";
-import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
-import { ContentLayout } from "@/components/admin-panel/content-layout";
-import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
-import Link from "next/link";
-import { InputFields } from "./input-fields";
-import { UploadCard } from "./upload-card";
-import { Loader2 } from "lucide-react";
-import { useToast } from "@/components/ui/use-toast";
- 
-export default function FRGeneratorPage() {
-  const router = useRouter();
-  const { toast } = useToast();
-  const [files, setFiles] = useState<File[]>([]);
-  const [formData, setFormData] = useState({
-    projectName: "",
-    description: "",
-    priority: "medium",
-  });
-  const [isSubmitting, setIsSubmitting] = useState(false);
+from typing import List, Dict
+from vectorstores.faiss_manager import FAISSManager
+from langchain.chains import RetrievalQA
+from langchain_community.llms import VertexAI
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsSubmitting(true);
+class DocumentProcessor:
+    def __init__(self):
+        # 初始化LLM和嵌入模型
+        self.llm = VertexAI(model_name="gemini-pro")
+        self.faiss_manager = FAISSManager(self._get_embedding_func())
 
-    try {
-      // 1. Upload files to the API
-      const fileIds = await Promise.all(
-        files.map(async (file) => {
-          const formData = new FormData();
-          formData.append('file', file);
-          
-          const response = await fetch('/api/upload', {
-            method: 'POST',
-            body: formData,
-          });
+    def _get_embedding_func(self):
+        """返回嵌入函数（与您的模型对接）"""
+        def embed_func(texts: List[str]) -> List[List[float]]:
+            # 调用您的实际模型
+            return self.model.get_embeddings(texts)  # 替换为真实调用
+        return embed_func
 
-          if (!response.ok) {
-            throw new Error(`Failed to upload ${file.name}`);
-          }
+    def generate_fr_document(self, file_paths: List[str], project_info: Dict = None) -> Dict:
+        """生成需求文档（集成FAISS检索）"""
+        # 1. 加载文档
+        documents = self.load_documents(file_paths)
+        if not documents:
+            raise ValueError("无可处理文档")
 
-          const data = await response.json();
-          return data.file_id;
-        })
-      );
+        # 2. 创建FAISS向量库和检索器
+        self.faiss_manager.create_from_texts(documents)
+        qa_chain = self._create_qa_chain()
 
-      // 2. Submit analysis request
-      const analysisResponse = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          file_ids: fileIds,
-          project_name: formData.projectName,
-          description: formData.description,
-          priority: formData.priority
-        }),
-      });
+        # 3. 构建提示词
+        prompt = self._build_prompt(project_info, documents[:3])
 
-      if (!analysisResponse.ok) {
-        throw new Error('Failed to start analysis');
-      }
+        # 4. 执行生成
+        result = qa_chain.invoke({"query": prompt})
 
-      const { task_id } = await analysisResponse.json();
+        # 5. 解析结果
+        return self._parse_result(result)
 
-      // 3. Poll for task completion
-      let taskCompleted = false;
-      let result = null;
-      
-      while (!taskCompleted) {
-        const statusResponse = await fetch(`/api/tasks/${task_id}`);
-        const taskData = await statusResponse.json();
-        
-        if (taskData.status === 'completed') {
-          taskCompleted = true;
-          result = taskData.result;
-        } else if (taskData.status === 'failed') {
-          throw new Error(taskData.error || 'Analysis failed');
+    def _create_qa_chain(self) -> RetrievalQA:
+        """创建检索增强生成链"""
+        return RetrievalQA.from_chain_type(
+            llm=self.llm,
+            chain_type="stuff",
+            retriever=self.faiss_manager.create_retriever(
+                search_kwargs={"k": 3, "score_threshold": 0.7}
+            ),
+            return_source_documents=True
+        )
+
+    def _build_prompt(self, project_info: Dict, context_docs: List[str]) -> str:
+        """构建结构化提示词"""
+        context_str = "\n".join(f"- {doc[:200]}..." for doc in context_docs)
+        return f"""
+        Generate a technical requirements document in markdown format:
+
+        # {project_info.get('name', 'Untitled Project')}
+        **Description**: {project_info.get('description', '')}
+
+        ## Core Requirements
+        {self._format_features(project_info.get('features', []))}
+
+        ## Technical Specifications
+        Include code samples where applicable.
+
+        Reference Context:
+        {context_str}
+        """
+
+    def _format_features(self, features: List[str]) -> str:
+        return "\n".join(f"- {feat}" for feat in features)
+
+    def _parse_result(self, result: Dict) -> Dict:
+        """解析生成结果"""
+        return {
+            "content": result["result"],
+            "sources": [doc.page_content for doc in result["source_documents"]]
         }
-        
-        // Wait 1 second before polling again
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-
-      // 4. Store results and navigate to draft page
-      const frDraftData = {
-        projectName: result.project_name || formData.projectName,
-        description: result.description || formData.description,
-        priority: formData.priority,
-        generatedContent: result.draft_content || generateFallbackContent(),
-        sourceDocuments: files.map(file => file.name)
-      };
-
-      sessionStorage.setItem('frDraftData', JSON.stringify(frDraftData));
-      router.push("/fr-generator/draft");
-
-    } catch (error) {
-      toast({
-        title: "Error",
-        description: error.message,
-        variant: "destructive",
-      });
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  const generateFallbackContent = () => {
-    return `# Functional Requirements Document\n\n**Project:** ${formData.projectName || "Demo Project"}\n\n## Overview\n${formData.description || "Sample description"}\n\n## Requirements\n1. Sample requirement 1\n2. Sample requirement 2\n3. Sample requirement 3`;
-  };
-
-  return (
-    <ContentLayout title="FR Generator">
-      <Breadcrumb>
-        <BreadcrumbList>
-          <BreadcrumbItem>
-            <BreadcrumbLink asChild>
-              <Link href="/">Home</Link>
-            </BreadcrumbLink>
-          </BreadcrumbItem>
-          <BreadcrumbSeparator />
-          <BreadcrumbItem>
-            <BreadcrumbPage>FR Generator</BreadcrumbPage>
-          </BreadcrumbItem>
-        </BreadcrumbList>
-      </Breadcrumb>
-
-      <div className="grid gap-6 grid-cols-1 lg:grid-cols-2 mt-6">
-        {/* Document Upload Section */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Upload Documents</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <UploadCard files={files} setFiles={setFiles} />
-          </CardContent>
-        </Card>
-
-        {/* FR Details Section */}
-        <Card>
-          <CardHeader>
-            <CardTitle>FR Information</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <form onSubmit={handleSubmit} className="space-y-4">
-              <InputFields formData={formData} setFormData={setFormData} />
-              
-              <div className="flex justify-end gap-4 pt-4">
-                <Button variant="outline" type="button">
-                  Cancel
-                </Button>
-                <Button 
-                  type="submit"
-                  disabled={files.length === 0 || !formData.projectName || isSubmitting}
-                >
-                  {isSubmitting ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Generating...
-                    </>
-                  ) : 'Generate Draft'}
-                </Button>
-              </div>
-            </form>
-          </CardContent>
-        </Card>
-      </div>
-    </ContentLayout>
-  );
-}
