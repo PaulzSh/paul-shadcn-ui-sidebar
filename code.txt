@@ -1,26 +1,21 @@
-def __create_qa_chain(self) -> RetrievalQA:
-    print("[Creating QA chain...]")
+# faiss_manager.py
+def create_retriever(self, search_kwargs: dict = None) -> BaseRetriever:
+    """仅创建检索器（不包含LLM）"""
+    if not self.vectorstore:
+        raise ValueError("请先调用create_from_texts()")
     
-    # 1. Verify components exist
-    if not hasattr(self, 'llm') or self.llm is None:
-        raise ValueError("LLM not initialized")
-    
-    if not hasattr(self, 'faiss_manager'):
-        raise ValueError("FAISS manager not initialized")
-    
-    # 2. Create retriever
-    retriever = self.faiss_manager.create_retriever(
-        search_kwargs={"k": 3, "score_threshold": 0.7}
+    return self.vectorstore.as_retriever(
+        search_kwargs=search_kwargs or {"k": 3}
     )
-    
-    # 3. Create QA chain
+
+# document_processor.py
+def __create_qa_chain(self) -> RetrievalQA:
+    """创建完整的QA链"""
     return RetrievalQA.from_chain_type(
-        llm=self.llm,  # Fixed variable name (was self.11m)
+        llm=self.llm,  # 使用初始化好的LLM
         chain_type="stuff",
-        retriever=retriever,
+        retriever=self.faiss_manager.create_retriever(
+            search_kwargs={"k": 3, "score_threshold": 0.7}
+        ),
         return_source_documents=True
     )
-	
-	
-	print("LLM type:", type(self.llm))
-print("Is Runnable:", isinstance(self.llm, Runnable))
