@@ -1,0 +1,145 @@
+from langchain.chains import RetrievalQA
+from langchain.llms import VertexAI
+from langchain.document_loaders import (
+    PyPDFLoader,
+    Docx2txtLoader,
+    TextLoader
+)
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import VertexAIEmbeddings
+from langchain.vectorstores import FAISS
+from typing import List, Dict
+import os
+import re
+
+class DocumentProcessor:
+    def __init__(self):
+        # 初始化模型与标准配置
+        self.llm = VertexAI(
+            model_name="gemini-pro",
+            temperature=0.7,
+            max_output_tokens=2048  # 恢复原始输出长度
+        )
+        self.embeddings = VertexAIEmbeddings()
+        
+        # 标准文档分割配置
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+
+    def load_documents(self, file_paths: List[str]) -> List[str]:
+        """加载并分割文档（同步阻塞式）"""
+        docs = []
+        for file_path in file_paths:
+            try:
+                ext = os.path.splitext(file_path)[1].lower()
+                if ext == '.pdf':
+                    loader = PyPDFLoader(file_path)
+                elif ext == '.docx':
+                    loader = Docx2txtLoader(file_path)
+                elif ext == '.txt':
+                    loader = TextLoader(file_path)
+                else:
+                    continue
+                
+                loaded_docs = loader.load()
+                split_docs = self.text_splitter.split_documents(loaded_docs)
+                docs.extend([doc.page_content for doc in split_docs])
+            except Exception as e:
+                print(f"Error processing {file_path}: {str(e)}")
+                continue
+        return docs
+
+    def create_retriever(self, documents: List[str]) -> RetrievalQA:
+        """创建标准检索器"""
+        vector_db = FAISS.from_texts(
+            texts=documents,
+            embedding=self.embeddings
+        )
+        
+        return RetrievalQA.from_chain_type(
+            llm=self.llm,
+            chain_type="stuff",
+            retriever=vector_db.as_retriever(search_kwargs={"k": 3}),  # 恢复top3检索
+            return_source_documents=True  # 恢复源文档返回
+        )
+
+    def generate_fr_document(self, file_paths: List[str], project_info: Dict = None) -> Dict:
+        """生成完整功能需求文档"""
+        # 1. 加载文档
+        documents = self.load_documents(file_paths)
+        if not documents:
+            raise ValueError("No valid documents could be processed")
+        
+        # 2. 创建检索器
+        qa_chain = self.create_retriever(documents)
+        
+        # 3. 完整提示模板
+        prompt = f"""
+        Generate a comprehensive Functional Requirements document including:
+        
+        1. Project Name: {project_info.get('name', 'New Project') if project_info else 'New Project'}
+        2. Description: {project_info.get('description', '') if project_info else ''}
+        3. Functional Requirements:
+           - List all key features
+           - Include priority levels
+        4. Technical Specifications:
+           - System architecture
+           - Data models
+           - Sample code implementations
+        
+        Context Documents:
+        {documents[:5]}  # 使用前5个文档块作为上下文
+        """
+        
+        # 4. 执行生成
+        result = qa_chain({"query": prompt})
+        
+        # 5. 完整结果解析
+        return {
+            "project_name": self._extract_section(r"1\. Project Name:\s*(.+)", result["result"]),
+            "description": self._extract_section(r"2\. Description:\s*(.+)", result["result"]),
+            "requirements": self._extract_list(r"3\. Functional Requirements:\s*(.+?)(?=\n\s*\d\.)", result["result"]),
+            "technical_specs": self._extract_section(r"4\. Technical Specifications:\s*(.+)", result["result"]),
+            "full_content": result["result"],
+            "source_documents": [doc.page_content for doc in result["source_documents"]]
+        }
+
+    def _extract_section(self, pattern: str, text: str) -> str:
+        """提取文档章节"""
+        match = re.search(pattern, text, re.DOTALL)
+        return match.group(1).strip() if match else ""
+
+    def _extract_list(self, pattern: str, text: str) -> List[str]:
+        """提取列表项"""
+        section = self._extract_section(pattern, text)
+        return [item.strip() for item in section.split("-")[1:]] if section else []
+
+# 使用示例
+if __name__ == "__main__":
+    processor = DocumentProcessor()
+    
+    try:
+        result = processor.generate_fr_document(
+            file_paths=["requirements.pdf", "design.docx"],
+            project_info={
+                "name": "SmartHome System",
+                "description": "IoT-based home automation platform"
+            }
+        )
+        
+        print("#" * 40)
+        print("Generated FR Document")
+        print("#" * 40)
+        print(f"Project: {result['project_name']}")
+        print(f"Description: {result['description']}")
+        print("\nRequirements:")
+        for req in result["requirements"]:
+            print(f"- {req}")
+        print("\nSource Documents:")
+        for i, doc in enumerate(result["source_documents"][:3], 1):
+            print(f"{i}. {doc[:100]}...")
+            
+    except Exception as e:
+        print(f"Document generation failed: {str(e)}")

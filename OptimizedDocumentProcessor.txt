@@ -1,0 +1,179 @@
+from langchain.chains import RetrievalQA
+from langchain.llms import VertexAI
+from langchain.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
+from langchain.text_splitter import (
+    RecursiveCharacterTextSplitter,
+    MarkdownHeaderTextSplitter
+)
+from langchain.embeddings import VertexAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.prompts import PromptTemplate
+from functools import lru_cache
+from typing import List, Dict, Tuple
+import os
+import re
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+class OptimizedDocumentProcessor:
+    def __init__(self):
+        # 初始化模型与组件（低temperature减少随机性）
+        self.llm = VertexAI(
+            model_name="gemini-pro",
+            temperature=0.1,  # 降低温度值减少token消耗
+            max_output_tokens=1024  # 限制输出长度
+        )
+        self.embeddings = VertexAIEmbeddings()
+        
+        # 文档分割配置（平衡信息保留与chunk大小）
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,  # 减小chunk大小
+            chunk_overlap=100,
+            length_function=len,
+            separators=["\n\n", "\n", "。", " ", ""]  # 中文友好分割
+        )
+        
+        # 并行处理配置
+        self.executor = ThreadPoolExecutor(max_workers=4)
+
+    @lru_cache(maxsize=100)  # 缓存嵌入结果
+    def get_embeddings(self, texts: Tuple[str]) -> List[List[float]]:
+        """缓存嵌入查询避免重复计算"""
+        return self.embeddings.embed_documents(list(texts))
+
+    async def load_document_async(self, file_path: str) -> List[str]:
+        """异步加载单个文档"""
+        loop = asyncio.get_event_loop()
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext == '.pdf':
+                loader = PyPDFLoader(file_path)
+            elif ext == '.docx':
+                loader = Docx2txtLoader(file_path)
+            elif ext == '.txt':
+                loader = TextLoader(file_path, encoding='utf-8')
+            else:
+                return []
+            
+            # 在线程池中执行阻塞IO操作
+            docs = await loop.run_in_executor(
+                self.executor,
+                lambda: loader.load_and_split(self.text_splitter)
+            )
+            return [doc.page_content for doc in docs if len(doc.page_content) > 20]  # 过滤空内容
+        
+        except Exception as e:
+            print(f"Error loading {file_path}: {str(e)}")
+            return []
+
+    async def load_documents(self, file_paths: List[str]) -> List[str]:
+        """并行加载所有文档"""
+        tasks = [self.load_document_async(fp) for fp in file_paths]
+        results = await asyncio.gather(*tasks)
+        return [text for sublist in results for text in sublist]
+
+    def create_retriever(self, documents: List[str]) -> RetrievalQA:
+        """创建优化的检索器"""
+        # 使用FAISS的IVF索引减少内存占用
+        vector_db = FAISS.from_texts(
+            texts=documents,
+            embedding=self.embeddings,
+            faiss_index=FAISS.IndexIVFFlat  # 使用聚类索引
+        )
+        
+        # 自定义检索模板（精确控制token使用）
+        qa_prompt = PromptTemplate(
+            input_variables=["context", "question"],
+            template="""基于以下上下文，用最简洁的语言回答问题。如果不知道就说不知道。
+            
+            上下文片段（按相关性排序）:
+            1. {context[0][:200]}...
+            2. {context[1][:200]}...
+            3. {context[2][:200]}...
+
+            问题: {question}
+            答案:""",  # 中文提示减少token消耗
+        )
+        
+        return RetrievalQA.from_chain_type(
+            llm=self.llm,
+            chain_type="stuff",
+            retriever=vector_db.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": 2}  # 仅检索top2最相关片段
+            ),
+            chain_type_kwargs={"prompt": qa_prompt},
+            return_source_documents=False  # 不返回源文档节省token
+        )
+
+    async def generate_concise_output(self, qa_chain, prompt: str) -> str:
+        """生成精简输出"""
+        loop = asyncio.get_event_loop()
+        try:
+            # 设置超时避免长时间运行
+            return await asyncio.wait_for(
+                loop.run_in_executor(
+                    self.executor,
+                    lambda: qa_chain.run(prompt)[:1000]  # 硬性截断
+                ),
+                timeout=30
+            )
+        except asyncio.TimeoutError:
+            return "Generation timeout"
+
+    def _optimize_prompt(self, project_info: Dict) -> str:
+        """构建最优提示模板"""
+        return (
+            f"用最简洁的Markdown格式生成需求文档，包含以下部分：\n"
+            f"# {project_info.get('name', '项目')}\n"
+            f"**核心需求**: 不超过3个关键点\n"
+            f"**技术指标**: 仅列出必要参数\n"
+            f"**示例代码**: 仅展示关键函数\n"
+            f"注意：每个部分不超过2句话"
+        )
+
+    def _parse_output(self, text: str) -> Dict:
+        """极简输出解析"""
+        return {
+            "project_name": re.search(r"# (.+)", text) or "项目",
+            "requirements": re.findall(r"\*\*核心需求\*\*:\s*(.+)", text),
+            "technical_specs": re.findall(r"\*\*技术指标\*\*:\s*(.+)", text),
+            "content": text
+        }
+
+    async def process_documents(self, file_paths: List[str], project_info: Dict) -> Dict:
+        """端到端处理流程"""
+        # 1. 并行加载文档
+        documents = await self.load_documents(file_paths)
+        if not documents:
+            raise ValueError("无法处理任何文档内容")
+        
+        # 2. 构建检索器（仅使用前500个字符的文档）
+        truncated_docs = [doc[:500] for doc in documents]
+        qa_chain = self.create_retriever(truncated_docs)
+        
+        # 3. 生成内容（严格限制prompt长度）
+        prompt = self._optimize_prompt(project_info)
+        output = await self.generate_concise_output(qa_chain, prompt)
+        
+        # 4. 解析结果
+        return {
+            **self._parse_output(output),
+            "token_estimate": len(output) // 4  # 粗略估算
+        }
+
+# 异步执行示例
+async def main():
+    processor = OptimizedDocumentProcessor()
+    try:
+        result = await processor.process_documents(
+            file_paths=["doc1.pdf", "spec.docx"],
+            project_info={"name": "智能监控系统", "description": "实时AI视频分析"}
+        )
+        print(f"生成结果（约{result['token_estimate']} tokens）:")
+        print(result["content"])
+    except Exception as e:
+        print(f"处理失败: {str(e)}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
