@@ -1,0 +1,155 @@
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import (
+    PyPDFDirectoryLoader,
+    Docx2txtLoader as UnstructuredDocxLoader,
+    TextLoader as UnstructuredTextLoader
+)
+from langchain_community.embeddings import VertexAIEmbeddings as VertexAIEmbeddingsCommunity
+from langchain_google_vertexai import VertexAI
+from langchain.chains import RetrievalQA
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from typing import List, Dict
+import os
+import re
+
+class UpdatedDocumentProcessor:
+    def __init__(self):
+        # 使用最新VertexAI初始化 (从langchain_google_vertexai)
+        self.llm = VertexAI(
+            model_name="gemini-pro",
+            temperature=0.7,
+            max_output_tokens=2048
+        )
+        
+        # 使用社区版Embeddings
+        self.embeddings = VertexAIEmbeddingsCommunity()
+        
+        # 文档分割配置
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+
+    def load_documents(self, file_paths: List[str]) -> List[str]:
+        """加载文档（使用最新loader类）"""
+        docs = []
+        for file_path in file_paths:
+            try:
+                ext = os.path.splitext(file_path)[1].lower()
+                if ext == '.pdf':
+                    # 使用PyPDFDirectoryLoader处理单个文件
+                    loader = PyPDFDirectoryLoader(os.path.dirname(file_path), 
+                                               glob_pattern=os.path.basename(file_path))
+                elif ext == '.docx':
+                    loader = UnstructuredDocxLoader(file_path)
+                elif ext == '.txt':
+                    loader = UnstructuredTextLoader(file_path)
+                else:
+                    continue
+                
+                loaded_docs = loader.load()
+                split_docs = self.text_splitter.split_documents(loaded_docs)
+                docs.extend([doc.page_content for doc in split_docs])
+            except Exception as e:
+                print(f"Error processing {file_path}: {str(e)}")
+                continue
+        return docs
+
+    def create_retriever(self, documents: List[str]) -> RetrievalQA:
+        """创建检索器（使用最新FAISS）"""
+        # 注意：新版FAISS需要显式指定embedding函数
+        vector_db = FAISS.from_texts(
+            texts=documents,
+            embedding=self.embeddings.embed_documents  # 显式传递embedding函数
+        )
+        
+        return RetrievalQA.from_chain_type(
+            llm=self.llm,
+            chain_type="stuff",
+            retriever=vector_db.as_retriever(
+                search_kwargs={"k": 3, "score_threshold": 0.5}  # 新增score阈值
+            ),
+            return_source_documents=True
+        )
+
+    def generate_fr_document(self, file_paths: List[str], project_info: Dict = None) -> Dict:
+        """生成需求文档"""
+        # 1. 加载文档
+        documents = self.load_documents(file_paths)
+        if not documents:
+            raise ValueError("No processable documents found")
+        
+        # 2. 创建检索器
+        qa_chain = self.create_retriever(documents)
+        
+        # 3. 更新后的提示模板
+        prompt = f"""
+        Generate a technical requirements document with these sections:
+        
+        1. PROJECT_TITLE: {project_info.get('name', 'Untitled')}
+        2. DESCRIPTION: {project_info.get('description', '')}
+        3. KEY_FEATURES:
+           - List features with priorities
+           - Include technical constraints
+        4. IMPLEMENTATION_DETAILS:
+           - Architecture diagrams
+           - Data flow descriptions
+           - Code snippets
+        
+        Reference these document excerpts:
+        {documents[:3]}
+        """
+        
+        # 4. 执行生成
+        result = qa_chain.invoke({"query": prompt})  # 使用新版invoke方法
+        
+        # 5. 解析结果
+        return self._parse_result(result)
+
+    def _parse_result(self, result: Dict) -> Dict:
+        """解析生成结果"""
+        content = result["result"]
+        return {
+            "project": self._extract_section(r"1\. PROJECT_TITLE:\s*(.+)", content),
+            "description": self._extract_section(r"2\. DESCRIPTION:\s*(.+)", content),
+            "features": self._extract_list(r"3\. KEY_FEATURES:\s*(.+?)(?=\n\s*4\.)", content),
+            "implementation": self._extract_section(r"4\. IMPLEMENTATION_DETAILS:\s*(.+)", content),
+            "sources": [doc.page_content[:200] + "..." for doc in result["source_documents"]],
+            "full_content": content
+        }
+
+    def _extract_section(self, pattern: str, text: str) -> str:
+        match = re.search(pattern, text, re.DOTALL)
+        return match.group(1).strip() if match else ""
+
+    def _extract_list(self, pattern: str, text: str) -> List[str]:
+        section = self._extract_section(pattern, text)
+        return [item.strip() for item in section.split("-")[1:]] if section else []
+
+# 使用示例
+if __name__ == "__main__":
+    processor = UpdatedDocumentProcessor()
+    
+    try:
+        result = processor.generate_fr_document(
+            file_paths=["specs.pdf", "requirements.docx"],
+            project_info={
+                "name": "Cloud Monitoring 2.0",
+                "description": "Distributed system performance tracking"
+            }
+        )
+        
+        print("=" * 50)
+        print("GENERATED REQUIREMENTS DOCUMENT")
+        print("=" * 50)
+        print(f"Project: {result['project']}")
+        print(f"\nDescription:\n{result['description']}")
+        print("\nKey Features:")
+        for feature in result["features"]:
+            print(f" - {feature}")
+        print("\nSource References:")
+        for i, source in enumerate(result["sources"], 1):
+            print(f"{i}. {source}")
+            
+    except Exception as e:
+        print(f"Generation failed: {str(e)}")
