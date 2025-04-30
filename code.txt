@@ -1,77 +1,76 @@
-from typing import List, Dict
-from vectorstores.faiss_manager import FAISSManager
-from langchain.chains import RetrievalQA
-from langchain_community.llms import VertexAI
+import numpy as np
+from typing import List
+from langchain.embeddings.base import Embeddings
 
-class DocumentProcessor:
+class CustomEmbeddings(Embeddings):
+    """Your existing implementation"""
     def __init__(self):
-        # 初始化LLM和嵌入模型
-        self.llm = VertexAI(model_name="gemini-pro")
-        self.faiss_manager = FAISSManager(self._get_embedding_func())
+        self.connector = VertexAIConnector()  # Your actual connector
+        self.model = self.connector.get_embedding_model()
+    
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        vectors = self.model.get_embeddings(texts)
+        return self._ensure_float_vectors(vectors)
+    
+    def embed_query(self, text: str) -> List[float]:
+        return self.embed_documents([text])[0]
+    
+    @staticmethod
+    def _ensure_float_vectors(vectors) -> List[List[float]]:
+        if isinstance(vectors, np.ndarray):
+            return vectors.astype(float).tolist()
+        return [[float(x) for x in vec] for vec in vectors]
 
-    def _get_embedding_func(self):
-        """返回嵌入函数（与您的模型对接）"""
-        def embed_func(texts: List[str]) -> List[List[float]]:
-            # 调用您的实际模型
-            return self.model.get_embeddings(texts)  # 替换为真实调用
-        return embed_func
 
-    def generate_fr_document(self, file_paths: List[str], project_info: Dict = None) -> Dict:
-        """生成需求文档（集成FAISS检索）"""
-        # 1. 加载文档
-        documents = self.load_documents(file_paths)
-        if not documents:
-            raise ValueError("无可处理文档")
+class CustomEmbeddingsTest:
+    """Test harness for CustomEmbeddings"""
+    
+    @staticmethod
+    def run_tests():
+        print("🚀 Starting CustomEmbeddings Tests...")
+        embeddings = CustomEmbeddings()
+        
+        # Test 1: Verify single document embedding
+        print("\n🔍 Test 1: Single Document Embedding")
+        test_text = "Hello world"
+        result = embeddings.embed_query(test_text)
+        CustomEmbeddingsTest._validate_embedding(result, f"'{test_text}'")
+        
+        # Test 2: Verify multiple documents
+        print("\n📚 Test 2: Multiple Documents")
+        texts = ["Hello", "LangChain", "FAISS integration"]
+        results = embeddings.embed_documents(texts)
+        for i, (text, vec) in enumerate(zip(texts, results)):
+            CustomEmbeddingsTest._validate_embedding(vec, f"document {i} ('{text}')")
+        
+        # Test 3: Edge cases
+        print("\� Edge Cases")
+        empty_result = embeddings.embed_documents([""])
+        CustomEmbeddingsTest._validate_embedding(empty_result[0], "empty string")
+        
+        print("\n✅ All tests completed!")
 
-        # 2. 创建FAISS向量库和检索器
-        self.faiss_manager.create_from_texts(documents)
-        qa_chain = self._create_qa_chain()
+    @staticmethod
+    def _validate_embedding(vector: List[float], description: str):
+        print(f"  Validating {description}:")
+        print(f"  → Type: {type(vector)}")
+        print(f"  → Length: {len(vector)}")
+        print(f"  → Sample values: {vector[:3]}...")
+        
+        assert isinstance(vector, list), f"Expected list, got {type(vector)}"
+        assert all(isinstance(x, float) for x in vector), "Non-float values detected"
+        print("  ✔ Validation passed")
 
-        # 3. 构建提示词
-        prompt = self._build_prompt(project_info, documents[:3])
 
-        # 4. 执行生成
-        result = qa_chain.invoke({"query": prompt})
+if __name__ == "__main__":
+    # Initialize with mock connector if needed
+    class VertexAIConnector:
+        def get_embedding_model(self):
+            return MockEmbeddingModel()
 
-        # 5. 解析结果
-        return self._parse_result(result)
+    class MockEmbeddingModel:
+        def get_embeddings(self, texts):
+            # Mock embedding: returns random vectors
+            return np.random.rand(len(texts), 384)  # 384-dim vectors
 
-    def _create_qa_chain(self) -> RetrievalQA:
-        """创建检索增强生成链"""
-        return RetrievalQA.from_chain_type(
-            llm=self.llm,
-            chain_type="stuff",
-            retriever=self.faiss_manager.create_retriever(
-                search_kwargs={"k": 3, "score_threshold": 0.7}
-            ),
-            return_source_documents=True
-        )
-
-    def _build_prompt(self, project_info: Dict, context_docs: List[str]) -> str:
-        """构建结构化提示词"""
-        context_str = "\n".join(f"- {doc[:200]}..." for doc in context_docs)
-        return f"""
-        Generate a technical requirements document in markdown format:
-
-        # {project_info.get('name', 'Untitled Project')}
-        **Description**: {project_info.get('description', '')}
-
-        ## Core Requirements
-        {self._format_features(project_info.get('features', []))}
-
-        ## Technical Specifications
-        Include code samples where applicable.
-
-        Reference Context:
-        {context_str}
-        """
-
-    def _format_features(self, features: List[str]) -> str:
-        return "\n".join(f"- {feat}" for feat in features)
-
-    def _parse_result(self, result: Dict) -> Dict:
-        """解析生成结果"""
-        return {
-            "content": result["result"],
-            "sources": [doc.page_content for doc in result["source_documents"]]
-        }
+    CustomEmbeddingsTest.run_tests()
