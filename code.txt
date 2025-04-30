@@ -1,32 +1,26 @@
-from typing import List, Union
-import numpy as np
-from google.cloud.aiplatform import TextEmbedding  # Import the actual class
-
-class CustomEmbeddings(Embeddings):
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """Handle TextEmbedding object responses"""
-        try:
-            # 1. Get TextEmbedding objects from VertexAI
-            text_embeddings = self.model.get_embeddings(texts)
-            
-            # 2. Extract vectors from TextEmbedding objects
-            vectors = []
-            for embedding_obj in text_embeddings:
-                if hasattr(embedding_obj, 'values'):
-                    # For newer VertexAI versions
-                    vectors.append([float(x) for x in embedding_obj.values])
-                elif hasattr(embedding_obj, 'embedding'):
-                    # For older versions
-                    vectors.append([float(x) for x in embedding_obj.embedding])
-                else:
-                    raise ValueError(f"Unknown TextEmbedding format: {dir(embedding_obj)}")
-            
-            return vectors
-            
-        except Exception as e:
-            print(f"Error in embed_documents: {str(e)}")
-            raise
-
-    def embed_query(self, text: str) -> List[float]:
-        """Single text embedding"""
-        return self.embed_documents([text])[0]
+def __create_qa_chain(self) -> RetrievalQA:
+    print("[Creating QA chain...]")
+    
+    # 1. Verify components exist
+    if not hasattr(self, 'llm') or self.llm is None:
+        raise ValueError("LLM not initialized")
+    
+    if not hasattr(self, 'faiss_manager'):
+        raise ValueError("FAISS manager not initialized")
+    
+    # 2. Create retriever
+    retriever = self.faiss_manager.create_retriever(
+        search_kwargs={"k": 3, "score_threshold": 0.7}
+    )
+    
+    # 3. Create QA chain
+    return RetrievalQA.from_chain_type(
+        llm=self.llm,  # Fixed variable name (was self.11m)
+        chain_type="stuff",
+        retriever=retriever,
+        return_source_documents=True
+    )
+	
+	
+	print("LLM type:", type(self.llm))
+print("Is Runnable:", isinstance(self.llm, Runnable))
