@@ -1,22 +1,17 @@
-from typing import Callable, List
+from typing import Union
 from langchain.embeddings.base import Embeddings
 
-class FunctionAsEmbedding(Embeddings):
-    """增强版函数适配器，支持更多验证"""
-    
-    def __init__(self, embed_func: Callable[[List[str]], List[List[float]]]):
-        if not callable(embed_func):
-            raise TypeError("必须传入可调用对象")
-        self.embed_func = embed_func
-    
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """添加输入验证"""
-        if not all(isinstance(t, str) for t in texts):
-            raise ValueError("输入必须全部是字符串")
-        return self.embed_func(texts)
-    
-    def embed_query(self, text: str) -> List[float]:
-        """查询嵌入"""
-        if not isinstance(text, str):
-            raise ValueError("输入必须是字符串")
-        return self.embed_documents([text])[0]
+class FAISSManager:
+    def __init__(self, embeddings: Union[Embeddings, Callable]):
+        # 类型检查增强
+        if not (isinstance(embeddings, Embeddings) or callable(embeddings)):
+            raise TypeError(
+                f"需传入Embeddings实例或可调用对象，得到 {type(embeddings)}"
+                "\n提示：确认CustomEmbeddings继承自langchain.embeddings.base.Embeddings"
+            )
+        
+        if isinstance(embeddings, Embeddings):
+            self.embeddings = embeddings
+        else:
+            from embeddings.adapters import FunctionAsEmbedding
+            self.embeddings = FunctionAsEmbedding(embeddings)

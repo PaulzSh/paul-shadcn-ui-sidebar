@@ -6,20 +6,19 @@ from embeddings.custom_embeddings import CustomEmbeddings
 from embeddings.adapters import FunctionAsEmbedding
 
 class FAISSManager:
-    """增强版FAISS管理类，支持检索器创建"""
-    
-    def __init__(self, embeddings: Union[CustomEmbeddings, Callable]):
-        """
-        参数:
-            embeddings: 可以是CustomEmbeddings实例或普通嵌入函数
-        """
-        if isinstance(embeddings, CustomEmbeddings):
+    def __init__(self, embeddings: Union[Embeddings, Callable]):
+        # 类型检查增强
+        if not (isinstance(embeddings, Embeddings) or callable(embeddings)):
+            raise TypeError(
+                f"需传入Embeddings实例或可调用对象，得到 {type(embeddings)}"
+                "\n提示：确认CustomEmbeddings继承自langchain.embeddings.base.Embeddings"
+            )
+        
+        if isinstance(embeddings, Embeddings):
             self.embeddings = embeddings
         else:
-            # 自动将函数包装为Embeddings对象
+            from embeddings.adapters import FunctionAsEmbedding
             self.embeddings = FunctionAsEmbedding(embeddings)
-        
-        self.vectorstore = None
 
     def create_from_texts(self, texts: List[str], **kwargs):
         """创建向量库并返回self以支持链式调用"""

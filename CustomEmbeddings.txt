@@ -1,30 +1,45 @@
 from typing import List
 import numpy as np
-from langchain.embeddings.base import Embeddings
-from models.my_model import TextEmbeddingModel  # 你的原始模型
+from langchain.embeddings.base import Embeddings  # 关键继承
 
-class CustomEmbeddings(Embeddings):
-    """LangChain兼容的嵌入模型封装"""
+class CustomEmbeddings(Embeddings):  # 继承基类
+    """符合LangChain规范的嵌入模型封装"""
     
-    def __init__(self, model_name: str):
-        self.model = TextEmbeddingModel.from_pretrained(model_name)
-    
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+    def __init__(self):
+        try:
+            self.connector = VertexAIConnector()
+            self.model = self.connector.get_embedding_model()
+            # 初始化后立即验证
+            test_embed = self.embed_documents(["test"])
+            if not isinstance(test_embed[0][0], float):
+                raise ValueError("嵌入输出类型验证失败")
+        except Exception as e:
+            raise RuntimeError(f"初始化失败: {str(e)}")
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:  # 修正类型提示
         """批量文档嵌入"""
+        if not texts or not all(isinstance(t, str) for t in texts):
+            raise ValueError("输入必须是非空字符串列表")
+            
         try:
             vectors = self.model.get_embeddings(texts)
             return self._ensure_float_vectors(vectors)
         except Exception as e:
             raise RuntimeError(f"文档嵌入失败: {str(e)}")
-    
+
     def embed_query(self, text: str) -> List[float]:
         """单条查询嵌入"""
+        if not isinstance(text, str):
+            raise ValueError("输入必须是字符串")
         return self.embed_documents([text])[0]
-    
+
     @staticmethod
     def _ensure_float_vectors(vectors) -> List[List[float]]:
         """确保输出为List[List[float]]"""
         if isinstance(vectors, np.ndarray):
-            return vectors.tolist()
-        return [vec.tolist() if hasattr(vec, 'tolist') else list(map(float, vec)) 
-                for vec in vectors]
+            return vectors.tolist()  # 修正方法名
+        return [
+            vec.tolist() if hasattr(vec, 'tolist') 
+            else [float(x) for x in vec]  # 强制类型转换
+            for vec in vectors
+        ]
