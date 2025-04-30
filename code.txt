@@ -1,50 +1,38 @@
-import numpy as np
-from typing import List
-from langchain_community.vectorstores import FAISS
-from custom_embeddings import CustomEmbeddings  # Your working implementation
+def embed_documents(self, texts: List[str]) -> List[List[float]]:
+    """Fixed implementation with proper response parsing"""
+    try:
+        # Get raw response from VertexAI
+        prediction_response = self.model.get_embeddings(texts)
+        self._debug_response(response)  # Log raw response
 
-class FAISSTestHarness:
-    def __init__(self):
-        self.embeddings = CustomEmbeddings()
-        self.vector_store = None
+        # Parse response based on actual return type
+        if hasattr(prediction_response, 'predictions'):  # Handle VertexAI response object
+            return [
+                self._parse_vertex_response(prediction, i)
+                for i, prediction in enumerate(prediction_response.predictions)
+            ]
+        elif isinstance(prediction_response, list):  # Handle direct list
+            return self._ensure_float_vectors(prediction_response)
+        else:
+            raise ValueError(f"Unexpected response type: {type(prediction_response)}")
+            
+    except Exception as e:
+        logger.error(f"Embedding failed: {str(e)}")
+        raise
 
-    def test_faiss_creation(self, texts: List[str]):
-        """Test FAISS index creation with custom embeddings"""
-        print("\n🔧 Testing FAISS Integration")
-        
-        # 1. Create FAISS index
-        self.vector_store = FAISS.from_texts(
-            texts=texts,
-            embedding=self.embeddings
-        )
-        print("✅ FAISS index created successfully")
-
-        # 2. Verify index stats
-        print(f"→ Documents in index: {self.vector_store.index.ntotal}")
-        print(f"→ Embedding dimension: {self.vector_store.index.d}")
-
-        # 3. Test similarity search
-        query = "test query"
-        print(f"\n🔍 Testing similarity search for: '{query}'")
-        results = self.vector_store.similarity_search(query, k=2)
-        print(f"→ Top result: {results[0].page_content}")
-        
-        return self.vector_store
-
-if __name__ == "__main__":
-    # Initialize test harness
-    tester = FAISSTestHarness()
-    
-    # Test data
-    test_texts = [
-        "LangChain is a framework for LLM applications",
-        "FAISS is a vector similarity search library",
-        "Embeddings convert text to numerical vectors"
-    ]
-    
-    # Run tests
-    vector_store = tester.test_faiss_creation(test_texts)
-    
-    # Optional: Save index for later use
-    vector_store.save_local("test_faiss_index")
-    print("\n💾 Saved FAISS index to 'test_faiss_index'")
+@staticmethod
+def _parse_vertex_response(prediction, index: int) -> List[float]:
+    """Handle VertexAI TextEmbedding response objects"""
+    if hasattr(prediction, 'values'):
+        return [float(x) for x in prediction.values]
+    elif hasattr(prediction, 'embedding'):
+        return [float(x) for x in prediction.embedding]
+    raise ValueError(f"Unsupported prediction format at index {index}")
+	
+def _debug_response(self, response):
+    """Log raw response structure for debugging"""
+    logger.debug(f"Response type: {type(response)}")
+    if hasattr(response, '__dict__'):
+        logger.debug(f"Response attributes: {vars(response)}")
+    elif isinstance(response, (list, np.ndarray)):
+        logger.debug(f"First item type: {type(response[0])}")
