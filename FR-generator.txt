@@ -1,0 +1,174 @@
+"use client";
+import { useRouter } from "next/navigation";
+import { useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
+import { ContentLayout } from "@/components/admin-panel/content-layout";
+import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
+import Link from "next/link";
+import { InputFields } from "./input-fields";
+import { UploadCard } from "./upload-card";
+import { Loader2 } from "lucide-react";
+import { useToast } from "@/components/ui/use-toast";
+
+export default function FRGeneratorPage() {
+  const router = useRouter();
+  const { toast } = useToast();
+  const [files, setFiles] = useState<File[]>([]);
+  const [formData, setFormData] = useState({
+    projectName: "",
+    description: "",
+    priority: "medium",
+  });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSubmitting(true);
+
+    try {
+      // 1. 上传所有文件
+      const uploadResponses = await Promise.all(
+        files.map(async (file) => {
+          const formData = new FormData();
+          formData.append('file', file);
+          
+          const response = await fetch('/api/upload', {
+            method: 'POST',
+            body: formData,
+          });
+
+          if (!response.ok) {
+            throw new Error(`文件上传失败: ${file.name}`);
+          }
+          return await response.json();
+        })
+      );
+      const fileIds = uploadResponses.map(res => res.file_id);
+
+      // 2. 提交分析请求（同步）
+      const analysisResponse = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          file_ids: fileIds,
+          project_name: formData.projectName,
+          description: formData.description,
+          priority: formData.priority
+        }),
+      });
+
+      if (!analysisResponse.ok) {
+        const errorData = await analysisResponse.json();
+        throw new Error(errorData.error || '文档分析失败');
+      }
+
+      // 3. 获取分析结果（同步直接返回）
+      const { result } = await analysisResponse.json();
+
+      // 4. 存储结果并跳转
+      const frDraftData = {
+        projectName: result.project_name || formData.projectName,
+        description: result.description || formData.description,
+        priority: formData.priority,
+        generatedContent: result.content_preview || generateFallbackContent(),
+        sourceDocuments: files.map(file => file.name),
+        fullContent: result.content_preview // 使用API返回的预览内容
+      };
+
+      sessionStorage.setItem('frDraftData', JSON.stringify(frDraftData));
+      router.push("/fr-generator/draft");
+
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : '发生未知错误';
+      toast({
+        title: "错误",
+        description: errorMessage,
+        variant: "destructive",
+      });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const generateFallbackContent = () => {
+    return `# 功能需求文档\n\n**项目名称:** ${formData.projectName || "示例项目"}\n\n## 概述\n${formData.description || "示例描述"}\n\n## 需求列表\n1. 示例需求 1\n2. 示例需求 2`;
+  };
+
+  return (
+    <ContentLayout title="生成需求文档">
+      <Breadcrumb>
+        <BreadcrumbList>
+          <BreadcrumbItem>
+            <BreadcrumbLink asChild>
+              <Link href="/">首页</Link>
+            </BreadcrumbLink>
+          </BreadcrumbItem>
+          <BreadcrumbSeparator />
+          <BreadcrumbItem>
+            <BreadcrumbPage>需求生成器</BreadcrumbPage>
+          </BreadcrumbItem>
+        </BreadcrumbList>
+      </Breadcrumb>
+
+      <div className="grid gap-6 grid-cols-1 lg:grid-cols-2 mt-6">
+        {/* 文档上传区域 */}
+        <Card>
+          <CardHeader>
+            <CardTitle>上传技术文档</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <UploadCard 
+              files={files} 
+              setFiles={setFiles}
+              accept=".pdf,.docx,.txt"
+              maxSize={10 * 1024 * 1024} // 10MB
+            />
+            <p className="text-sm text-muted-foreground mt-2">
+              支持PDF、Word、TXT格式，单个文件不超过10MB
+            </p>
+          </CardContent>
+        </Card>
+
+        {/* 需求信息表单 */}
+        <Card>
+          <CardHeader>
+            <CardTitle>项目信息</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <InputFields 
+                formData={formData} 
+                setFormData={setFormData} 
+                requiredFields={['projectName']}
+              />
+              
+              <div className="flex justify-end gap-4 pt-4">
+                <Button 
+                  variant="outline" 
+                  type="button"
+                  onClick={() => router.back()}
+                >
+                  取消
+                </Button>
+                <Button 
+                  type="submit"
+                  disabled={files.length === 0 || !formData.projectName || isSubmitting}
+                >
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      正在生成...
+                    </>
+                  ) : '生成需求草案'}
+                </Button>
+              </div>
+            </form>
+          </CardContent>
+        </Card>
+      </div>
+    </ContentLayout>
+  );
+}
