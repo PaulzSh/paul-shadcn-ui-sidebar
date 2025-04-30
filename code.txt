@@ -1,76 +1,50 @@
 import numpy as np
 from typing import List
-from langchain.embeddings.base import Embeddings
+from langchain_community.vectorstores import FAISS
+from custom_embeddings import CustomEmbeddings  # Your working implementation
 
-class CustomEmbeddings(Embeddings):
-    """Your existing implementation"""
+class FAISSTestHarness:
     def __init__(self):
-        self.connector = VertexAIConnector()  # Your actual connector
-        self.model = self.connector.get_embedding_model()
-    
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        vectors = self.model.get_embeddings(texts)
-        return self._ensure_float_vectors(vectors)
-    
-    def embed_query(self, text: str) -> List[float]:
-        return self.embed_documents([text])[0]
-    
-    @staticmethod
-    def _ensure_float_vectors(vectors) -> List[List[float]]:
-        if isinstance(vectors, np.ndarray):
-            return vectors.astype(float).tolist()
-        return [[float(x) for x in vec] for vec in vectors]
+        self.embeddings = CustomEmbeddings()
+        self.vector_store = None
 
+    def test_faiss_creation(self, texts: List[str]):
+        """Test FAISS index creation with custom embeddings"""
+        print("\n🔧 Testing FAISS Integration")
+        
+        # 1. Create FAISS index
+        self.vector_store = FAISS.from_texts(
+            texts=texts,
+            embedding=self.embeddings
+        )
+        print("✅ FAISS index created successfully")
 
-class CustomEmbeddingsTest:
-    """Test harness for CustomEmbeddings"""
-    
-    @staticmethod
-    def run_tests():
-        print("🚀 Starting CustomEmbeddings Tests...")
-        embeddings = CustomEmbeddings()
-        
-        # Test 1: Verify single document embedding
-        print("\n🔍 Test 1: Single Document Embedding")
-        test_text = "Hello world"
-        result = embeddings.embed_query(test_text)
-        CustomEmbeddingsTest._validate_embedding(result, f"'{test_text}'")
-        
-        # Test 2: Verify multiple documents
-        print("\n📚 Test 2: Multiple Documents")
-        texts = ["Hello", "LangChain", "FAISS integration"]
-        results = embeddings.embed_documents(texts)
-        for i, (text, vec) in enumerate(zip(texts, results)):
-            CustomEmbeddingsTest._validate_embedding(vec, f"document {i} ('{text}')")
-        
-        # Test 3: Edge cases
-        print("\� Edge Cases")
-        empty_result = embeddings.embed_documents([""])
-        CustomEmbeddingsTest._validate_embedding(empty_result[0], "empty string")
-        
-        print("\n✅ All tests completed!")
+        # 2. Verify index stats
+        print(f"→ Documents in index: {self.vector_store.index.ntotal}")
+        print(f"→ Embedding dimension: {self.vector_store.index.d}")
 
-    @staticmethod
-    def _validate_embedding(vector: List[float], description: str):
-        print(f"  Validating {description}:")
-        print(f"  → Type: {type(vector)}")
-        print(f"  → Length: {len(vector)}")
-        print(f"  → Sample values: {vector[:3]}...")
+        # 3. Test similarity search
+        query = "test query"
+        print(f"\n🔍 Testing similarity search for: '{query}'")
+        results = self.vector_store.similarity_search(query, k=2)
+        print(f"→ Top result: {results[0].page_content}")
         
-        assert isinstance(vector, list), f"Expected list, got {type(vector)}"
-        assert all(isinstance(x, float) for x in vector), "Non-float values detected"
-        print("  ✔ Validation passed")
-
+        return self.vector_store
 
 if __name__ == "__main__":
-    # Initialize with mock connector if needed
-    class VertexAIConnector:
-        def get_embedding_model(self):
-            return MockEmbeddingModel()
-
-    class MockEmbeddingModel:
-        def get_embeddings(self, texts):
-            # Mock embedding: returns random vectors
-            return np.random.rand(len(texts), 384)  # 384-dim vectors
-
-    CustomEmbeddingsTest.run_tests()
+    # Initialize test harness
+    tester = FAISSTestHarness()
+    
+    # Test data
+    test_texts = [
+        "LangChain is a framework for LLM applications",
+        "FAISS is a vector similarity search library",
+        "Embeddings convert text to numerical vectors"
+    ]
+    
+    # Run tests
+    vector_store = tester.test_faiss_creation(test_texts)
+    
+    # Optional: Save index for later use
+    vector_store.save_local("test_faiss_index")
+    print("\n💾 Saved FAISS index to 'test_faiss_index'")
