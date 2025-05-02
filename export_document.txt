@@ -9,14 +9,14 @@ exporter = DocumentExporter()
 def export_word():
     try:
         data = request.get_json()
-        if not data or 'content' not in data:
-            return jsonify({"error": "Content required"}), 400
+        if not data or 'editedContent' not in data:
+            return jsonify({"error": "editedContent is required"}), 400
         
-        docx_path = exporter.export_word(data['content'])
+        docx_path = exporter.export_word(data['editedContent'])
         return send_file(
             docx_path,
             as_attachment=True,
-            download_name="document.docx",
+            download_name=data.get('filename', 'document.docx'),
             mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         )
     except Exception as e:
@@ -27,14 +27,14 @@ def export_word():
 def export_pdf():
     try:
         data = request.get_json()
-        if not data or 'content' not in data:
-            return jsonify({"error": "Content required"}), 400
+        if not data or 'editedContent' not in data:
+            return jsonify({"error": "editedContent is required"}), 400
         
-        pdf_path = exporter.export_pdf(data['content'])
+        pdf_path = exporter.export_pdf(data['editedContent'])
         return send_file(
             pdf_path,
             as_attachment=True,
-            download_name="document.pdf",
+            download_name=data.get('filename', 'document.pdf'),
             mimetype='application/pdf'
         )
     except Exception as e:
