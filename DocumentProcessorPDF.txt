@@ -1,0 +1,92 @@
+import os
+from pathlib import Path
+from typing import Dict, Optional
+from docx import Document
+from docx2pdf import convert
+
+class DocumentService:
+    def __init__(self, template_root: str = "templates"):
+        self.template_root = Path(template_root)
+        self.template_root.mkdir(exist_ok=True)
+        
+        # Define template paths
+        self.templates = {
+            "fr_template": self.template_root / "FR_Template.docx",
+            "brd_template": self.template_root / "BRD_Template.docx"
+        }
+
+    def get_template(self, template_name: str) -> Path:
+        """Get validated template path"""
+        template_path = self.templates.get(template_name)
+        if not template_path or not template_path.exists():
+            raise FileNotFoundError(f"Template '{template_name}' not found at {template_path}")
+        return template_path
+
+    def generate_docx(
+        self,
+        template_name: str,
+        content_data: Dict,
+        metadata: Optional[Dict] = None,
+        output_path: Optional[str] = None
+    ) -> Path:
+        """Generate filled DOCX document"""
+        template_path = self.get_template(template_name)
+        
+        if not output_path:
+            output_path = self.template_root / f"temp_{os.urandom(4).hex()}.docx"
+        else:
+            output_path = Path(output_path)
+
+        doc = Document(template_path)
+        
+        # Fill content and metadata
+        self._fill_content(doc, content_data)
+        if metadata:
+            self._apply_metadata(doc, metadata)
+        
+        doc.save(output_path)
+        return output_path
+
+    def generate_pdf(
+        self,
+        template_name: str,
+        content_data: Dict,
+        metadata: Optional[Dict] = None,
+        existing_docx: Optional[str] = None,
+        output_path: Optional[str] = None
+    ) -> Path:
+        """Generate PDF with optional existing DOCX"""
+        docx_path = existing_docx or self.generate_docx(
+            template_name=template_name,
+            content_data=content_data,
+            metadata=metadata
+        )
+        
+        if not output_path:
+            output_path = self.template_root / f"export_{os.urandom(4).hex()}.pdf"
+        else:
+            output_path = Path(output_path)
+
+        convert(docx_path, output_path)
+        return output_path
+
+    def _fill_content(self, doc: Document, data: Dict):
+        """Fill content in document paragraphs and tables"""
+        for paragraph in doc.paragraphs:
+            for key, value in data.items():
+                if key in paragraph.text:
+                    paragraph.text = paragraph.text.replace(key, str(value))
+        
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for key, value in data.items():
+                        if key in cell.text:
+                            cell.text = cell.text.replace(key, str(value))
+
+    def _apply_metadata(self, doc: Document, metadata: Dict):
+        """Set document metadata properties"""
+        if 'title' in metadata:
+            doc.core_properties.title = metadata['title']
+        if 'author' in metadata:
+            doc.core_properties.author = metadata['author']

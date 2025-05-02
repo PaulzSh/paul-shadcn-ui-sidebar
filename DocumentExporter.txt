@@ -1,0 +1,54 @@
+import os
+from pathlib import Path
+from typing import Dict
+from docx import Document
+from docx2pdf import convert
+
+class DocumentExporter:
+    def __init__(self, template_dir: str = "templates"):
+        self.template_dir = Path(template_dir)
+        self.template_path = self.template_dir / "FR_Template.docx"
+        
+        if not self.template_path.exists():
+            raise FileNotFoundError(f"Template not found at {self.template_path}")
+
+    def export_word(self, content: Dict, output_path: str = None) -> str:
+        """Always generate new Word document"""
+        output_path = output_path or self._generate_temp_path("docx")
+        doc = Document(self.template_path)
+        
+        # Fill content
+        for paragraph in doc.paragraphs:
+            for key, value in content.items():
+                if key in paragraph.text:
+                    paragraph.text = paragraph.text.replace(key, str(value))
+        
+        # Fill tables
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for key, value in content.items():
+                        if key in cell.text:
+                            cell.text = cell.text.replace(key, str(value))
+        
+        doc.save(output_path)
+        return output_path
+
+    def export_pdf(self, content: Dict, output_path: str = None) -> str:
+        """Generate PDF by first creating Word doc"""
+        # First create Word document
+        docx_path = self.export_word(content)
+        
+        # Then convert to PDF
+        output_path = output_path or self._generate_temp_path("pdf")
+        convert(docx_path, output_path)
+        
+        # Clean up temporary Word file
+        os.unlink(docx_path)
+        return output_path
+
+    def _generate_temp_path(self, extension: str) -> str:
+        """Generate temporary file path"""
+        temp_dir = self.template_dir / "temp"
+        temp_dir.mkdir(exist_ok=True)
+        return str(temp_dir / f"doc_{os.urandom(4).hex()}.{extension}")

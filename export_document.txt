@@ -1,0 +1,42 @@
+from flask import Flask, request, send_file, jsonify
+from document_service import DocumentExporter
+import logging
+
+app = Flask(__name__)
+exporter = DocumentExporter()
+
+@app.route('/api/export/word', methods=['POST'])
+def export_word():
+    try:
+        data = request.get_json()
+        if not data or 'content' not in data:
+            return jsonify({"error": "Content required"}), 400
+        
+        docx_path = exporter.export_word(data['content'])
+        return send_file(
+            docx_path,
+            as_attachment=True,
+            download_name="document.docx",
+            mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        )
+    except Exception as e:
+        logging.error(f"Word export failed: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/export/pdf', methods=['POST'])
+def export_pdf():
+    try:
+        data = request.get_json()
+        if not data or 'content' not in data:
+            return jsonify({"error": "Content required"}), 400
+        
+        pdf_path = exporter.export_pdf(data['content'])
+        return send_file(
+            pdf_path,
+            as_attachment=True,
+            download_name="document.pdf",
+            mimetype='application/pdf'
+        )
+    except Exception as e:
+        logging.error(f"PDF export failed: {str(e)}")
+        return jsonify({"error": str(e)}), 500
