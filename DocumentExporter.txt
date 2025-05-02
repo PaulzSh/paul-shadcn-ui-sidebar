@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from typing import Dict
 from docx import Document
@@ -12,40 +13,95 @@ class DocumentExporter:
         if not self.template_path.exists():
             raise FileNotFoundError(f"Template not found at {self.template_path}")
 
-    def export_word(self, content: Dict, output_path: str = None) -> str:
-        """Always generate new Word document"""
+    def _parse_text_content(self, text_content: str) -> Dict:
+        """Parse raw text content into structured fields"""
+        # Initialize with empty values
+        fields = {
+            "OPPM": "",
+            "USER_STORY_LINK": "",
+            "PCS_LINK": "",
+            "AUTHOR": "",
+            "REVIEWER": "",
+            "STATUS": "Draft",
+            "REQUIREMENT": "",
+            "SCOPE": "",
+            "ASSUMPTION": "",
+            "SOLUTION": "",
+            "SCENARIOS": "",
+            "CONSIDERATION": "",
+            "TEST_SCENARIO": "",
+            "FLOW": "",
+            "ATTACHMENT": "",
+            "INFORMATION_SECURITY": ""
+        }
+
+        # Extract sections using markdown headers
+        sections = re.split(r'\n## ', text_content)
+        for section in sections:
+            if not section.strip():
+                continue
+                
+            header, *content = section.split('\n', 1)
+            content = content[0].strip() if content else ""
+            
+            # Map headers to template fields
+            header_map = {
+                "OPPM": "OPPM",
+                "User Story Link": "USER_STORY_LINK",
+                "PCS Link": "PCS_LINK",
+                "Author": "AUTHOR",
+                "Reviewer": "REVIEWER",
+                "Status": "STATUS",
+                "Requirements": "REQUIREMENT",
+                "Scope Statement": "SCOPE",
+                "Assumptions": "ASSUMPTION",
+                "Solution": "SOLUTION",
+                "Scenarios": "SCENARIOS",
+                "Implementation Criteria": "CONSIDERATION",
+                "Test Scenarios": "TEST_SCENARIO",
+                "Customer Flow": "FLOW",
+                "Attachments": "ATTACHMENT",
+                "Information Security": "INFORMATION_SECURITY"
+            }
+            
+            if header in header_map:
+                fields[header_map[header]] = content
+        
+        return fields
+
+    def export_word(self, text_content: str, output_path: str = None) -> str:
+        """Generate Word document from raw text content"""
         output_path = output_path or self._generate_temp_path("docx")
         doc = Document(self.template_path)
         
-        # Fill content
-        for paragraph in doc.paragraphs:
-            for key, value in content.items():
-                if key in paragraph.text:
-                    paragraph.text = paragraph.text.replace(key, str(value))
-        
-        # Fill tables
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for key, value in content.items():
-                        if key in cell.text:
-                            cell.text = cell.text.replace(key, str(value))
+        template_fields = self._parse_text_content(text_content)
+        self._fill_template(doc, template_fields)
         
         doc.save(output_path)
         return output_path
 
-    def export_pdf(self, content: Dict, output_path: str = None) -> str:
-        """Generate PDF by first creating Word doc"""
-        # First create Word document
-        docx_path = self.export_word(content)
-        
-        # Then convert to PDF
+    def export_pdf(self, text_content: str, output_path: str = None) -> str:
+        """Generate PDF from raw text content"""
+        docx_path = self.export_word(text_content)
         output_path = output_path or self._generate_temp_path("pdf")
-        convert(docx_path, output_path)
         
-        # Clean up temporary Word file
-        os.unlink(docx_path)
+        convert(docx_path, output_path)
+        os.unlink(docx_path)  # Remove temporary docx
         return output_path
+
+    def _fill_template(self, doc: Document, fields: Dict):
+        """Replace placeholders in Word template"""
+        for paragraph in doc.paragraphs:
+            for field, value in fields.items():
+                if field in paragraph.text:
+                    paragraph.text = paragraph.text.replace(field, str(value))
+        
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for field, value in fields.items():
+                        if field in cell.text:
+                            cell.text = cell.text.replace(field, str(value))
 
     def _generate_temp_path(self, extension: str) -> str:
         """Generate temporary file path"""
