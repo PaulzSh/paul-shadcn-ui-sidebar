@@ -1,21 +1,161 @@
-# faiss_manager.py
-def create_retriever(self, search_kwargs: dict = None) -> BaseRetriever:
-    """仅创建检索器（不包含LLM）"""
-    if not self.vectorstore:
-        raise ValueError("请先调用create_from_texts()")
+def build_structured_prompt(self, project_info: dict, context_docs: list[str]) -> str:
+    """Generate structured prompt with Markdown formatting"""
+    context_str = "\n".join(f"- {doc[:300]}..." for doc in context_docs[:3])  # Truncate long documents
     
-    return self.vectorstore.as_retriever(
-        search_kwargs=search_kwargs or {"k": 3}
-    )
+    return f"""
+    Generate a technical requirements document strictly following this Markdown template:
 
-# document_processor.py
-def __create_qa_chain(self) -> RetrievalQA:
-    """创建完整的QA链"""
-    return RetrievalQA.from_chain_type(
-        llm=self.llm,  # 使用初始化好的LLM
-        chain_type="stuff",
-        retriever=self.faiss_manager.create_retriever(
-            search_kwargs={"k": 3, "score_threshold": 0.7}
-        ),
-        return_source_documents=True
-    )
+    ## OPPM
+    {project_info.get('oppm', '')}
+
+    ## User Story Link
+    [{project_info.get('user_story', '')}]({project_info.get('user_story', '')})
+
+    ## PCS Link
+    [{project_info.get('pcs_link', '')}]({project_info.get('pcs_link', '')})
+
+    ## Author
+    {project_info.get('author', '')}
+
+    ## Reviewer
+    {project_info.get('reviewer', '')}
+
+    ## Status
+    {project_info.get('status', 'Draft')}
+
+    ## Requirements
+    - [List 3-5 key functional requirements]
+    - Prioritize based on business value
+    - Include acceptance criteria
+
+    ## Scope Statements
+    - [System boundaries]
+    - [In-scope features]
+    - [Out-of-scope items]
+
+    ## Assumptions
+    - [Technical assumptions]
+    - [Dependencies]
+    - [Constraints]
+
+    ## Solutions
+    - [Proposed architecture]
+    - [Technology stack]
+    - [Integration points]
+
+    ## Scenarios
+    - [Primary use case]
+    - [Alternate flows]
+    - [Error conditions]
+
+    ## Implementation Considerations
+    - [Deployment strategy]
+    - [Migration approach]
+    - [Performance requirements]
+
+    ## Test Scenarios
+    1. [Happy path test]
+    2. [Edge case test] 
+    3. [Failure scenario]
+
+    ## Customer Flow
+    ```mermaid
+    graph TD
+        A[Start] --> B[Step 1]
+        B --> C[Step 2]
+    ```
+
+    Context documents summary:
+    {context_str}
+    """
+	
+========================================
+import re
+from typing import Dict, List
+
+def parse_markdown_response(content: str) -> Dict[str, str | List[str]]:
+    """Parse AI-generated Markdown into structured data"""
+    
+    def extract_section(pattern: str) -> str:
+        match = re.search(pattern, content, re.DOTALL)
+        return match.group(1).strip() if match else ""
+    
+    def extract_list(pattern: str) -> List[str]:
+        section = extract_section(pattern)
+        return [
+            item.strip()[2:]  # Remove bullet points
+            for item in section.split("\n") 
+            if item.strip().startswith("-")
+        ] if section else []
+    
+    def extract_numbered_list(pattern: str) -> List[str]:
+        section = extract_section(pattern)
+        return [
+            re.sub(r'^\d+\.\s*', '', item.strip())  # Remove numbering
+            for item in section.split("\n") 
+            if re.match(r'^\d+\.', item.strip())
+        ] if section else []
+    
+    return {
+        "metadata": {
+            "oppm": extract_section(r"## OPPM\n(.+?)(?=\n##)"),
+            "user_story": extract_section(r"## User Story Link\n(.+?)(?=\n##)"),
+            "pcs_link": extract_section(r"## PCS Link\n(.+?)(?=\n##)"),
+            "author": extract_section(r"## Author\n(.+?)(?=\n##)"),
+            "reviewer": extract_section(r"## Reviewer\n(.+?)(?=\n##)"),
+            "status": extract_section(r"## Status\n(.+?)(?=\n##)")
+        },
+        "content": {
+            "requirements": extract_list(r"## Requirements\n(.+?)(?=\n##)"),
+            "scope": extract_list(r"## Scope Statements\n(.+?)(?=\n##)"),
+            "assumptions": extract_list(r"## Assumptions\n(.+?)(?=\n##)"),
+            "solutions": extract_list(r"## Solutions\n(.+?)(?=\n##)"),
+            "scenarios": extract_list(r"## Scenarios\n(.+?)(?=\n##)"),
+            "implementation_considerations": extract_list(r"## Implementation Considerations\n(.+?)(?=\n##)"),
+            "test_scenarios": extract_numbered_list(r"## Test Scenarios\n(.+?)(?=\n##)"),
+            "customer_flow": extract_section(r"## Customer Flow\n```mermaid\n(.+?)\n```")
+        },
+        "raw_markdown": content
+    }
+	
+	
+==========================================================
+from docx import Document
+from typing import Dict
+
+class TemplateFiller:
+    @staticmethod
+    def fill_docx_template(template_path: str, output_path: str, data: Dict):
+        """Fill Word template with structured data"""
+        doc = Document(template_path)
+        
+        mapping = {
+            # Metadata fields
+            "QRD0": data["metadata"]["oppm"],
+            "user_story": data["metadata"]["user_story"],
+            "pcs_link": data["metadata"]["pcs_link"],
+            
+            # Content fields
+            "requirement": "\n• ".join(data["content"]["requirements"]),
+            "scope": "\n• ".join(data["content"]["scope"]),
+            "test_scenario": "\n".join(
+                f"{i+1}. {scenario}" 
+                for i, scenario in enumerate(data["content"]["test_scenarios"])
+            )
+        }
+        
+        # Process paragraphs
+        for paragraph in doc.paragraphs:
+            for key, value in mapping.items():
+                if key in paragraph.text:
+                    paragraph.text = paragraph.text.replace(key, str(value))
+        
+        # Process tables
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for key, value in mapping.items():
+                        if key in cell.text:
+                            cell.text = cell.text.replace(key, str(value))
+        
+        doc.save(output_path)
