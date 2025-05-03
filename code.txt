@@ -1,20 +1,17 @@
+import re
+from pprint import pprint
+
 def parse_markdown_content(content, mapping):
-    # Pattern to match markdown headers and their content
+    # Main pattern to match markdown headers and their content
     pattern = r'\*\*(.*?)\*\*\n(.*?)(?=\n\*\*|\Z)'
-    
-    # Find all matches
     matches = re.findall(pattern, content, re.DOTALL)
     
-    # Process the matches into a dictionary
     result = {}
     for header, content in matches:
-        # Clean up the content (remove leading/trailing whitespace)
         cleaned_content = content.strip()
         
-        # Check if this header is in our mapping
-        for original, new in mapping.items():
-            if header == original:
-                result[new] = cleaned_content
-                break
+        # Add to result if mapping exists
+        if header in mapping:
+            result[mapping[header]] = cleaned_content
     
     return result
