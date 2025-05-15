@@ -1,14 +1,15 @@
 "use client";
 import { useCallback, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Upload, FileUp } from "lucide-react";
+import { Upload, FileUp, Loader2 } from "lucide-react";
 import { useDropzone } from "react-dropzone";
+import { toast } from "@/components/ui/use-toast";
 
-export function DocumentUpload() {
-  const [files, setFiles] = useState([]);
+export function DocumentUpload({ onUploadSuccess }: { onUploadSuccess?: () => void }) {
+  const [files, setFiles] = useState<Array<{ file: File, preview: string }>>([]);
   const [isUploading, setIsUploading] = useState(false);
 
-  const onDrop = useCallback((acceptedFiles) => {
+  const onDrop = useCallback((acceptedFiles: File[]) => {
     setFiles(acceptedFiles.map(file => ({
       file,
       preview: URL.createObjectURL(file)
@@ -21,18 +22,34 @@ export function DocumentUpload() {
       'application/pdf': ['.pdf'],
       'application/msword': ['.doc'],
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
-      'text/markdown': ['.md']
-    }
+      'text/markdown': ['.md'],
+      'text/plain': ['.txt']
+    },
+    maxSize: 10 * 1024 * 1024, // 10MB
   });
 
   const handleUpload = () => {
+    if (files.length === 0) return;
+    
     setIsUploading(true);
-    // Simulate upload
+    
+    // Simulate API upload
     setTimeout(() => {
       setIsUploading(false);
       setFiles([]);
-      alert('Files uploaded successfully!');
+      toast({
+        title: "Upload Successful",
+        description: `${files.length} document(s) have been added to the knowledge base`,
+      });
+      if (onUploadSuccess) onUploadSuccess();
     }, 2000);
+  };
+
+  const removeFile = (index: number) => {
+    const newFiles = [...files];
+    URL.revokeObjectURL(newFiles[index].preview);
+    newFiles.splice(index, 1);
+    setFiles(newFiles);
   };
 
   return (
@@ -55,21 +72,31 @@ export function DocumentUpload() {
             }
           </p>
           <p className="text-xs text-muted-foreground">
-            PDF, DOC, DOCX, MD (Max 10MB)
+            PDF, DOC, DOCX, MD, TXT (Max 10MB)
           </p>
         </div>
       </div>
 
       {files.length > 0 && (
-        <div className="space-y-2">
+        <div className="space-y-4">
           <h4 className="text-sm font-medium">Selected Files:</h4>
           <ul className="space-y-2">
             {files.map((fileWrapper, index) => (
               <li key={index} className="flex items-center justify-between text-sm p-2 bg-gray-50 rounded">
-                <span className="truncate">{fileWrapper.file.name}</span>
-                <span className="text-muted-foreground">
-                  {(fileWrapper.file.size / 1024 / 1024).toFixed(2)} MB
-                </span>
+                <div className="flex items-center space-x-2">
+                  <span className="truncate max-w-xs">{fileWrapper.file.name}</span>
+                  <span className="text-muted-foreground text-xs">
+                    {(fileWrapper.file.size / 1024 / 1024).toFixed(2)} MB
+                  </span>
+                </div>
+                <Button 
+                  variant="ghost" 
+                  size="sm" 
+                  className="text-red-600 hover:text-red-700"
+                  onClick={() => removeFile(index)}
+                >
+                  Remove
+                </Button>
               </li>
             ))}
           </ul>
@@ -80,7 +107,7 @@ export function DocumentUpload() {
           >
             {isUploading ? (
               <>
-                <FileUp className="h-4 w-4 mr-2 animate-pulse" />
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                 Uploading...
               </>
             ) : (
