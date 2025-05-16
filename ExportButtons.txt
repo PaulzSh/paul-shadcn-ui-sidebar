@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/use-toast';
-import { Download, FileText, FileUp } from 'lucide-react';
+import { Download, FileText, FileUp, Save } from 'lucide-react';
 
 interface ExportButtonsProps {
   editedContent: string;
@@ -14,7 +14,7 @@ export function ExportButtons({
   filename = 'document',
   className = ''
 }: ExportButtonsProps) {
-  const [exporting, setExporting] = useState<'word' | 'pdf' | null>(null);
+  const [exporting, setExporting] = useState<'word' | 'pdf' | 'draft' | null>(null);
   const { toast } = useToast();
 
   const handleExport = async (format: 'word' | 'pdf') => {
@@ -63,8 +63,68 @@ export function ExportButtons({
     }
   };
 
+  const handleSaveDraft = async () => {
+    setExporting('draft');
+    
+    try {
+      // Simulate API call to save draft
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // In a real implementation, you would call your API endpoint here
+      // Example:
+      /*
+      const response = await fetch('/api/save-draft', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          content: editedContent,
+          filename: filename.replace(/\s+/g, '_')
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      */
+
+      toast({
+        title: 'Draft Saved',
+        description: 'Your document has been saved as a draft',
+        className: 'bg-blue-50 text-blue-800'
+      });
+    } catch (error) {
+      toast({
+        title: 'Save Failed',
+        description: error instanceof Error ? error.message : 'Unknown error occurred',
+        variant: 'destructive',
+        className: 'bg-red-50 text-red-800'
+      });
+    } finally {
+      setExporting(null);
+    }
+  };
+
   return (
     <div className={`flex flex-wrap gap-3 ${className}`}>
+      <Button
+        onClick={() => handleSaveDraft()}
+        disabled={!!exporting}
+        variant={exporting === 'draft' ? 'default' : 'outline'}
+        className="gap-2 px-4 py-2 min-w-[140px] transition-all bg-gray-600 hover:bg-gray-700 text-white"
+      >
+        {exporting === 'draft' ? (
+          <>
+            <Save className="h-4 w-4 animate-pulse" />
+            <span>Saving...</span>
+          </>
+        ) : (
+          <>
+            <Save className="h-4 w-4" />
+            <span>Save as Draft</span>
+          </>
+        )}
+      </Button>
+
       <Button
         onClick={() => handleExport('word')}
         disabled={!!exporting}
