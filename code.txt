@@ -1,47 +1,11 @@
-import { ToastProvider } from '@/lib/hooks/use-toast';
-
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode
-}) {
-  return (
-    <html lang="en">
-      <body>
-        <ToastProvider>
-          {children}
-        </ToastProvider>
-      </body>
-    </html>
-  );
-}
-
-
-import { useToast } from '@/lib/hooks/use-toast';
-
-export function ExportButtons({ 
-  editedContent, 
-  filename = 'document',
-  className = ''
-}: ExportButtonsProps) {
-  const { toast } = useToast();
-  
-  const handleSaveDraft = async () => {
-    try {
-      // Your save logic...
-      toast({
-        title: 'Draft Saved',
-        description: 'Your document has been saved as a draft',
-        className: 'bg-blue-50 text-blue-800'
-      });
-    } catch (error) {
-      toast({
-        title: 'Save Failed',
-        description: error instanceof Error ? error.message : 'Unknown error occurred',
-        variant: 'destructive',
-      });
+const useSimpleToast = () => {
+  return {
+    toast: ({ title, description }: { title: string; description: string }) => {
+      console.log(title, description);
+      // Or use your preferred notification method
+      alert(`${title}: ${description}`);
     }
   };
+};
 
-  // ... rest of your component
-}
+const { toast } = useSimpleToast();
