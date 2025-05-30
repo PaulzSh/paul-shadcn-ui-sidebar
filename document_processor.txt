@@ -1,0 +1,472 @@
+import os
+import json
+import uuid
+from datetime import datetime
+from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor
+from langchain.text_splitter import (
+    RecursiveCharacterTextSplitter, 
+    MarkdownHeaderTextSplitter,
+    Language
+)
+from langchain.document_loaders import (
+    PyPDFLoader, 
+    Docx2txtLoader,
+    UnstructuredFileLoader,
+    UnstructuredExcelLoader
+)
+from vertex_connector import VertexAIConnector
+from oracledb import Connection
+from dataclasses import dataclass, asdict
+import hashlib
+from enum import Enum
+
+class ContentType(str, Enum):
+    TEXT = "TEXT"
+    TABLE = "TABLE"
+    HEADER = "HEADER"
+    LIST = "LIST"
+    CODE = "CODE"
+    OTHER = "OTHER"
+
+@dataclass
+class DocumentChunk:
+    chunk_id: str
+    document_id: str
+    version_id: str
+    chunk_number: int
+    content_type: ContentType
+    content_text: str
+    metadata: dict
+    start_page: Optional[int] = None
+    end_page: Optional[int] = None
+    is_manually_adjusted: bool = False
+    important_keywords: List[str] = None
+    embedding_model: Optional[str] = None
+    embedding_version: Optional[str] = None
+
+class DocumentProcessor:
+    """增强版文档处理流水线"""
+    
+    def __init__(self, db_conn: Connection, embedding_model: str = "text-embedding-004"):
+        self.db_conn = db_conn
+        self.connector = VertexAIConnector()
+        self.embedding_model = self.connector.get_embedding_model(embedding_model)
+        self.generative_model = self.connector.get_generative_model()
+        
+        # 配置不同内容类型的分块策略
+        self.chunking_config = {
+            ContentType.TEXT: {
+                "chunk_size": 1500,
+                "chunk_overlap": 300,
+                "separators": ["\n\n", "\n", "。", "．", " "]
+            },
+            ContentType.TABLE: {
+                "chunk_size": 2000,
+                "chunk_overlap": 100,
+                "keep_separator": True
+            },
+            ContentType.HEADER: {
+                "chunk_size": 500,
+                "chunk_overlap": 50,
+                "separators": ["\n"]
+            },
+            ContentType.CODE: {
+                "chunk_size": 1000,
+                "chunk_overlap": 200,
+                "separators": ["\n\n", "\n"]
+            }
+        }
+    
+    def process_document_batch(self, file_paths: List[str], batch_id: str):
+        """批量处理文档"""
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = []
+            for file_path in file_paths:
+                futures.append(executor.submit(self.process_document, file_path, batch_id))
+            
+            results = []
+            for future in futures:
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    results.append({"error": str(e)})
+            
+            return results
+    
+    def process_document(self, file_path: str, batch_id: str = None):
+        """处理单个文档的完整流程"""
+        try:
+            # 1. 提取文档元数据
+            doc_metadata = self._extract_metadata(file_path)
+            
+            # 2. 保存文档到数据库
+            doc_id = self._save_document_to_db(file_path, doc_metadata, batch_id)
+            
+            # 3. 创建初始版本
+            version_id = self._create_document_version(doc_id)
+            
+            # 4. 加载和分块文档内容
+            chunks = self._load_and_chunk(file_path, doc_id, version_id)
+            
+            # 5. 自动提取关键信息
+            enriched_chunks = self._extract_key_info(chunks)
+            
+            # 6. 生成嵌入向量
+            self._generate_embeddings(enriched_chunks)
+            
+            # 7. 保存到数据库和向量库
+            self._save_chunks(enriched_chunks)
+            
+            # 8. 创建审核任务
+            self._create_review_task(doc_id, version_id)
+            
+            return {
+                "status": "success",
+                "document_id": doc_id,
+                "version_id": version_id,
+                "chunk_count": len(enriched_chunks)
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "error": str(e),
+                "file_path": file_path
+            }
+    
+    def _extract_metadata(self, file_path: str) -> Dict:
+        """提取文档元数据"""
+        file_name = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        file_ext = os.path.splitext(file_name)[1].lower()
+        
+        # 计算文件哈希
+        with open(file_path, "rb") as f:
+            file_hash = hashlib.sha256(f.read()).hexdigest()
+        
+        # 基本元数据
+        metadata = {
+            "file_name": file_name,
+            "file_path": file_path,
+            "file_size": file_size,
+            "file_type": file_ext[1:].upper(),
+            "file_hash": file_hash,
+            "processing_date": datetime.now().isoformat()
+        }
+        
+        # TODO: 添加更多元数据提取逻辑
+        return metadata
+    
+    def _save_document_to_db(self, file_path: str, metadata: Dict, batch_id: str = None) -> str:
+        """保存文档到数据库并返回文档ID"""
+        doc_id = str(uuid.uuid4())
+        cursor = self.db_conn.cursor()
+        
+        try:
+            cursor.execute("""
+                INSERT INTO DOCUMENTS (
+                    DOCUMENT_ID, DOCUMENT_NUMBER, TITLE, 
+                    DOCUMENT_TYPE, FILE_PATH, FILE_SIZE,
+                    CATEGORY, STATUS, PUBLISHED_DATE,
+                    CREATED_BY, METADATA, BATCH_ID
+                ) VALUES (
+                    :1, :2, :3, :4, :5, :6, :7, :8, :9, :10, :11, :12
+                )
+            """, [
+                doc_id,
+                self._generate_doc_number(),
+                metadata.get("title", os.path.basename(file_path)),
+                metadata["file_type"],
+                file_path,
+                metadata["file_size"],
+                "UNCATEGORIZED",
+                "PROCESSING",
+                None,  # published_date
+                "system",
+                json.dumps(metadata),
+                batch_id
+            ])
+            
+            self.db_conn.commit()
+            return doc_id
+        except Exception as e:
+            self.db_conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+    
+    def _create_document_version(self, document_id: str) -> str:
+        """创建文档版本记录"""
+        version_id = str(uuid.uuid4())
+        cursor = self.db_conn.cursor()
+        
+        try:
+            cursor.execute("""
+                INSERT INTO DOCUMENT_VERSIONS (
+                    VERSION_ID, DOCUMENT_ID, VERSION_NUMBER,
+                    EFFECTIVE_DATE, CHANGE_DESCRIPTION, FILE_HASH,
+                    CREATED_BY
+                ) VALUES (
+                    :1, :2, 1, NULL, 'Initial version', :3, 'system'
+                )
+            """, [
+                version_id,
+                document_id,
+                self._get_file_hash(document_id)
+            ])
+            
+            self.db_conn.commit()
+            return version_id
+        except Exception as e:
+            self.db_conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+    
+    def _load_and_chunk(self, file_path: str, doc_id: str, version_id: str) -> List[DocumentChunk]:
+        """加载文档并进行智能分块"""
+        # 根据文件类型选择合适的加载器
+        loader = self._get_loader(file_path)
+        raw_docs = loader.load()
+        
+        # 预处理文档内容
+        processed_chunks = []
+        for doc in raw_docs:
+            # 自动检测内容类型
+            content_type = self._detect_content_type(doc.page_content)
+            
+            # 应用不同的分块策略
+            chunks = self._apply_chunking_strategy(doc, content_type)
+            
+            # 转换为标准格式
+            for i, chunk in enumerate(chunks):
+                processed_chunks.append(DocumentChunk(
+                    chunk_id=str(uuid.uuid4()),
+                    document_id=doc_id,
+                    version_id=version_id,
+                    chunk_number=i,
+                    content_type=content_type,
+                    content_text=chunk.page_content,
+                    metadata={
+                        **doc.metadata,
+                        "content_type": content_type.value,
+                        "source_file": file_path
+                    },
+                    start_page=doc.metadata.get("page", 0),
+                    end_page=doc.metadata.get("page", 0)
+                ))
+        
+        return processed_chunks
+    
+    def _get_loader(self, file_path: str):
+        """根据文件类型获取合适的加载器"""
+        file_ext = os.path.splitext(file_path)[1].lower()
+        
+        if file_ext == '.pdf':
+            return PyPDFLoader(file_path)
+        elif file_ext in ('.docx', '.doc'):
+            return Docx2txtLoader(file_path)
+        elif file_ext in ('.xlsx', '.xls', '.csv'):
+            return UnstructuredExcelLoader(file_path)
+        else:
+            return UnstructuredFileLoader(file_path)
+    
+    def _detect_content_type(self, content: str) -> ContentType:
+        """自动检测内容类型"""
+        lines = content.split('\n')
+        
+        # 检测表格
+        if any('\t' in line or '|' in line for line in lines[:5]):
+            return ContentType.TABLE
+        
+        # 检测代码
+        if any(line.strip().startswith(('def ', 'class ', 'import ', 'function ')) for line in lines[:5]):
+            return ContentType.CODE
+        
+        # 检测标题
+        if len(lines) == 1 and len(content) < 100 and content.isupper():
+            return ContentType.HEADER
+        
+        # 检测列表
+        if any(line.strip().startswith(('•', '-', '*', '1.', 'a.')) for line in lines[:3]):
+            return ContentType.LIST
+        
+        return ContentType.TEXT
+    
+    def _apply_chunking_strategy(self, doc, content_type: ContentType):
+        """应用适合内容类型的分块策略"""
+        config = self.chunking_config.get(content_type, self.chunking_config[ContentType.TEXT])
+        
+        if content_type == ContentType.TABLE:
+            # 表格保持完整不分块
+            return [doc]
+        elif content_type == ContentType.CODE:
+            # 代码按函数/类分块
+            splitter = RecursiveCharacterTextSplitter.from_language(
+                language=Language.PYTHON,
+                **config
+            )
+            return splitter.split_documents([doc])
+        else:
+            # 普通文本分块
+            splitter = RecursiveCharacterTextSplitter(**config)
+            return splitter.split_documents([doc])
+    
+    def _extract_key_info(self, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
+        """使用LLM提取关键信息"""
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = []
+            for chunk in chunks:
+                if chunk.content_type in [ContentType.TEXT, ContentType.HEADER]:
+                    futures.append(executor.submit(
+                        self._enrich_chunk_with_llm, chunk
+                    ))
+                else:
+                    futures.append(chunk)  # 非文本内容不处理
+            
+            enriched_chunks = []
+            for future in futures:
+                if isinstance(future, DocumentChunk):
+                    enriched_chunks.append(future)
+                else:
+                    try:
+                        enriched_chunks.append(future.result())
+                    except Exception:
+                        enriched_chunks.append(future)
+            
+            return enriched_chunks
+    
+    def _enrich_chunk_with_llm(self, chunk: DocumentChunk) -> DocumentChunk:
+        """使用LLM丰富内容块信息"""
+        prompt = f"""
+        分析以下文档内容并提取关键信息:
+        
+        {chunk.content_text[:2000]}  # 限制输入长度
+        
+        请返回JSON格式结果包含:
+        - key_phrases: 最重要的3-5个短语
+        - summary: 简洁摘要(50字内)
+        - entities: 识别的重要实体(人名、组织、日期等)
+        """
+        
+        try:
+            response = self.generative_model.generate_content(prompt)
+            result = json.loads(response.text)
+            
+            # 更新块元数据
+            chunk.metadata.update({
+                "key_phrases": result.get("key_phrases", []),
+                "summary": result.get("summary", ""),
+                "entities": result.get("entities", [])
+            })
+            
+            # 自动标记重要关键词
+            if "key_phrases" in result:
+                chunk.important_keywords = result["key_phrases"]
+            
+            return chunk
+        except Exception:
+            return chunk  # LLM处理失败时返回原始块
+    
+    def _generate_embeddings(self, chunks: List[DocumentChunk]):
+        """为内容块生成嵌入向量"""
+        texts = [chunk.content_text for chunk in chunks]
+        
+        # 批量生成嵌入
+        embeddings = self.embedding_model.get_embeddings(texts)
+        
+        # 更新块信息
+        for chunk, embedding in zip(chunks, embeddings):
+            chunk.embedding_model = self.embedding_model.model_name
+            chunk.embedding_version = datetime.now().isoformat()
+            chunk.metadata["embedding_info"] = {
+                "model": self.embedding_model.model_name,
+                "generated_at": chunk.embedding_version
+            }
+    
+    def _save_chunks(self, chunks: List[DocumentChunk]):
+        """保存内容块到数据库和向量库"""
+        # 保存到Oracle
+        self._save_chunks_to_db(chunks)
+        
+        # 更新FAISS向量库
+        self._update_vector_store(chunks)
+    
+    def _save_chunks_to_db(self, chunks: List[DocumentChunk]):
+        """保存内容块到数据库"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            for chunk in chunks:
+                cursor.execute("""
+                    INSERT INTO DOCUMENT_CHUNKS (
+                        CHUNK_ID, DOCUMENT_ID, VERSION_ID, CHUNK_NUMBER,
+                        CONTENT_TYPE, CONTENT_TEXT, METADATA, CREATED_AT
+                    ) VALUES (
+                        :1, :2, :3, :4, :5, :6, :7, SYSTIMESTAMP
+                    )
+                """, [
+                    chunk.chunk_id,
+                    chunk.document_id,
+                    chunk.version_id,
+                    chunk.chunk_number,
+                    chunk.content_type.value,
+                    chunk.content_text,
+                    json.dumps(chunk.metadata)
+                ])
+            
+            self.db_conn.commit()
+        except Exception as e:
+            self.db_conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+    
+    def _update_vector_store(self, chunks: List[DocumentChunk]):
+        """更新向量存储"""
+        # TODO: 实现增量更新FAISS索引的逻辑
+        pass
+    
+    def _create_review_task(self, doc_id: str, version_id: str):
+        """创建人工审核任务"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            cursor.execute("""
+                INSERT INTO DOCUMENT_REVIEWS (
+                    REVIEW_ID, DOCUMENT_ID, VERSION_ID,
+                    REVIEW_STATUS, REVIEWER_ID, CREATED_AT
+                ) VALUES (
+                    :1, :2, :3, 'PENDING', NULL, SYSTIMESTAMP
+                )
+            """, [
+                str(uuid.uuid4()),
+                doc_id,
+                version_id
+            ])
+            
+            self.db_conn.commit()
+        except Exception as e:
+            self.db_conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+    
+    def _generate_doc_number(self) -> str:
+        """生成文档编号"""
+        # TODO: 实现业务特定的文档编号生成逻辑
+        return f"DOC-{datetime.now().strftime('%Y%m%d')}-{uuid.uuid4().hex[:6].upper()}"
+    
+    def _get_file_hash(self, document_id: str) -> str:
+        """获取文档文件哈希"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT FILE_HASH FROM DOCUMENTS WHERE DOCUMENT_ID = :1
+            """, [document_id])
+            
+            result = cursor.fetchone()
+            return result[0] if result else ""
+        finally:
+            cursor.close()

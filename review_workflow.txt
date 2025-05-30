@@ -1,0 +1,259 @@
+from enum import Enum
+from typing import List, Dict, Optional
+from datetime import datetime
+from dataclasses import dataclass
+from oracledb import Connection
+import uuid
+import json
+
+class ReviewStatus(str, Enum):
+    PENDING = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    CHANGES_REQUESTED = "CHANGES_REQUESTED"
+
+@dataclass
+class ReviewTask:
+    review_id: str
+    document_id: str
+    version_id: str
+    status: ReviewStatus
+    reviewer_id: Optional[str]
+    created_at: datetime
+    completed_at: Optional[datetime]
+    comments: Optional[str]
+
+@dataclass
+class ReviewComment:
+    comment_id: str
+    review_id: str
+    chunk_id: str
+    comment_text: str
+    suggested_change: Optional[str]
+    created_by: str
+    created_at: datetime
+    resolved: bool
+
+class ReviewWorkflow:
+    """人工审核工作流系统"""
+    
+    def __init__(self, db_conn: Connection):
+        self.db_conn = db_conn
+    
+    def get_pending_reviews(self, reviewer_id: str = None) -> List[ReviewTask]:
+        """获取待审核任务列表"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            query = """
+                SELECT r.REVIEW_ID, r.DOCUMENT_ID, r.VERSION_ID, 
+                       r.REVIEW_STATUS, r.REVIEWER_ID, r.CREATED_AT,
+                       r.COMPLETED_AT, r.REVIEW_COMMENTS,
+                       d.TITLE, d.DOCUMENT_NUMBER, v.VERSION_NUMBER
+                FROM DOCUMENT_REVIEWS r
+                JOIN DOCUMENTS d ON r.DOCUMENT_ID = d.DOCUMENT_ID
+                JOIN DOCUMENT_VERSIONS v ON r.VERSION_ID = v.VERSION_ID
+                WHERE r.REVIEW_STATUS = 'PENDING'
+            """
+            
+            if reviewer_id:
+                query += " AND (r.REVIEWER_ID IS NULL OR r.REVIEWER_ID = :1)"
+                cursor.execute(query, [reviewer_id])
+            else:
+                cursor.execute(query)
+            
+            results = []
+            for row in cursor:
+                results.append(ReviewTask(
+                    review_id=row[0],
+                    document_id=row[1],
+                    version_id=row[2],
+                    status=ReviewStatus(row[3]),
+                    reviewer_id=row[4],
+                    created_at=row[5],
+                    completed_at=row[6],
+                    comments=row[7]
+                ))
+            
+            return results
+        finally:
+            cursor.close()
+    
+    def claim_review_task(self, review_id: str, reviewer_id: str) -> bool:
+        """认领审核任务"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            cursor.execute("""
+                UPDATE DOCUMENT_REVIEWS
+                SET REVIEWER_ID = :1, REVIEW_STATUS = 'IN_PROGRESS'
+                WHERE REVIEW_ID = :2 AND REVIEW_STATUS = 'PENDING'
+            """, [reviewer_id, review_id])
+            
+            self.db_conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            self.db_conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+    
+    def submit_review(self, review_id: str, status: ReviewStatus, 
+                    comments: List[Dict], reviewer_id: str) -> bool:
+        """提交审核结果"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            # 1. 更新审核任务状态
+            cursor.execute("""
+                UPDATE DOCUMENT_REVIEWS
+                SET REVIEW_STATUS = :1,
+                    REVIEW_COMMENTS = :2,
+                    COMPLETED_AT = SYSTIMESTAMP
+                WHERE REVIEW_ID = :3 AND REVIEWER_ID = :4
+            """, [status.value, json.dumps(comments), review_id, reviewer_id])
+            
+            # 2. 如果审核通过，更新文档状态
+            if status == ReviewStatus.APPROVED:
+                cursor.execute("""
+                    UPDATE DOCUMENTS d
+                    SET STATUS = 'PUBLISHED'
+                    WHERE d.DOCUMENT_ID = (
+                        SELECT DOCUMENT_ID FROM DOCUMENT_REVIEWS
+                        WHERE REVIEW_ID = :1
+                    )
+                """, [review_id])
+            
+            self.db_conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            self.db_conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+    
+    def add_review_comment(self, review_id: str, chunk_id: str, 
+                         comment_text: str, suggested_change: str,
+                         created_by: str) -> ReviewComment:
+        """添加审核评论"""
+        comment_id = str(uuid.uuid4())
+        cursor = self.db_conn.cursor()
+        
+        try:
+            cursor.execute("""
+                INSERT INTO REVIEW_COMMENTS (
+                    COMMENT_ID, REVIEW_ID, CHUNK_ID,
+                    COMMENT_TEXT, SUGGESTED_CHANGE,
+                    CREATED_BY, CREATED_AT, RESOLVED
+                ) VALUES (
+                    :1, :2, :3, :4, :5, :6, SYSTIMESTAMP, 'N'
+                )
+            """, [
+                comment_id,
+                review_id,
+                chunk_id,
+                comment_text,
+                suggested_change,
+                created_by
+            ])
+            
+            self.db_conn.commit()
+            
+            return ReviewComment(
+                comment_id=comment_id,
+                review_id=review_id,
+                chunk_id=chunk_id,
+                comment_text=comment_text,
+                suggested_change=suggested_change,
+                created_by=created_by,
+                created_at=datetime.now(),
+                resolved=False
+            )
+        except Exception as e:
+            self.db_conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+    
+    def resolve_comment(self, comment_id: str, resolved_by: str) -> bool:
+        """解决评论"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            cursor.execute("""
+                UPDATE REVIEW_COMMENTS
+                SET RESOLVED = 'Y', RESOLVED_BY = :1, RESOLVED_AT = SYSTIMESTAMP
+                WHERE COMMENT_ID = :2
+            """, [resolved_by, comment_id])
+            
+            self.db_conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            self.db_conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+    
+    def get_document_chunks_for_review(self, document_id: str, version_id: str) -> List[Dict]:
+        """获取文档内容块供审核"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT c.CHUNK_ID, c.CHUNK_NUMBER, c.CONTENT_TYPE, 
+                       c.CONTENT_TEXT, c.METADATA, d.TITLE, v.VERSION_NUMBER
+                FROM DOCUMENT_CHUNKS c
+                JOIN DOCUMENTS d ON c.DOCUMENT_ID = d.DOCUMENT_ID
+                JOIN DOCUMENT_VERSIONS v ON c.VERSION_ID = v.VERSION_ID
+                WHERE c.DOCUMENT_ID = :1 AND c.VERSION_ID = :2
+                ORDER BY c.CHUNK_NUMBER
+            """, [document_id, version_id])
+            
+            chunks = []
+            for row in cursor:
+                metadata = json.loads(row[4]) if row[4] else {}
+                chunks.append({
+                    "chunk_id": row[0],
+                    "chunk_number": row[1],
+                    "content_type": row[2],
+                    "content_text": row[3],
+                    "metadata": metadata,
+                    "document_title": row[5],
+                    "version_number": row[6]
+                })
+            
+            return chunks
+        finally:
+            cursor.close()
+    
+    def get_comments_for_review(self, review_id: str) -> List[ReviewComment]:
+        """获取审核任务的所有评论"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT COMMENT_ID, REVIEW_ID, CHUNK_ID,
+                       COMMENT_TEXT, SUGGESTED_CHANGE,
+                       CREATED_BY, CREATED_AT, RESOLVED
+                FROM REVIEW_COMMENTS
+                WHERE REVIEW_ID = :1
+                ORDER BY CREATED_AT
+            """, [review_id])
+            
+            comments = []
+            for row in cursor:
+                comments.append(ReviewComment(
+                    comment_id=row[0],
+                    review_id=row[1],
+                    chunk_id=row[2],
+                    comment_text=row[3],
+                    suggested_change=row[4],
+                    created_by=row[5],
+                    created_at=row[6],
+                    resolved=row[7] == 'Y'
+                ))
+            
+            return comments
+        finally:
+            cursor.close()

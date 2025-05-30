@@ -1,0 +1,427 @@
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta
+from oracledb import Connection
+import json
+from dataclasses import dataclass
+from vertex_connector import VertexAIConnector
+from concurrent.futures import ThreadPoolExecutor
+import uuid
+
+@dataclass
+class TemporalAnalysisResult:
+    document_id: str
+    document_title: str
+    version_number: int
+    effective_date: Optional[datetime]
+    change_description: Optional[str]
+    impact_score: float
+    affected_areas: List[str]
+    predicted_expiry: Optional[datetime]
+
+class AdvancedDocumentAnalysis:
+    """高级文档分析模块"""
+    
+    def __init__(self, db_conn: Connection):
+        self.db_conn = db_conn
+        self.connector = VertexAIConnector()
+        self.generative_model = self.connector.get_generative_model()
+    
+    def cross_document_analysis(self, query: str, document_ids: List[str] = None) -> Dict:
+        """跨文档综合分析"""
+        # 1. 检索相关文档块
+        relevant_chunks = self._retrieve_relevant_chunks(query, document_ids)
+        
+        # 2. 按文档分组
+        grouped_chunks = self._group_chunks_by_document(relevant_chunks)
+        
+        # 3. 获取文档元数据
+        doc_metadata = self._get_document_metadata(grouped_chunks.keys())
+        
+        # 4. 使用LLM进行综合分析
+        analysis_result = self._perform_llm_analysis(query, grouped_chunks, doc_metadata)
+        
+        return analysis_result
+    
+    def temporal_analysis(self, date_range: Dict[str, datetime], 
+                        category: str = None) -> List[TemporalAnalysisResult]:
+        """时效性分析"""
+        # 1. 查询时间范围内的文档版本
+        versions = self._get_versions_in_date_range(date_range, category)
+        
+        # 2. 分析变更模式
+        results = []
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = []
+            for version in versions:
+                futures.append(executor.submit(
+                    self._analyze_version_impact,
+                    version
+                ))
+            
+            for future in futures:
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    print(f"分析失败: {str(e)}")
+        
+        # 3. 整体趋势分析
+        trend_analysis = self._analyze_trends(results, date_range)
+        
+        return {
+            "version_results": results,
+            "trend_analysis": trend_analysis
+        }
+    
+    def compare_versions(self, document_id: str, 
+                       version_id1: str, version_id2: str) -> Dict:
+        """比较两个文档版本"""
+        # 获取两个版本的内容
+        chunks_v1 = self._get_version_chunks(document_id, version_id1)
+        chunks_v2 = self._get_version_chunks(document_id, version_id2)
+        
+        # 生成差异报告
+        diff_report = self._generate_diff_report(chunks_v1, chunks_v2)
+        
+        return diff_report
+    
+    def _retrieve_relevant_chunks(self, query: str, document_ids: List[str] = None) -> List[Dict]:
+        """检索相关文档块"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            # 这里简化处理，实际应该使用向量搜索
+            query_clause = """
+                WHERE c.CONTENT_TEXT LIKE '%' || :1 || '%'
+            """
+            
+            if document_ids:
+                query_clause += " AND c.DOCUMENT_ID IN :2"
+            
+            cursor.execute(f"""
+                SELECT c.CHUNK_ID, c.DOCUMENT_ID, c.VERSION_ID,
+                       c.CONTENT_TEXT, c.METADATA, d.TITLE
+                FROM DOCUMENT_CHUNKS c
+                JOIN DOCUMENTS d ON c.DOCUMENT_ID = d.DOCUMENT_ID
+                {query_clause}
+                ORDER BY c.DOCUMENT_ID
+                LIMIT 50
+            """, [query, document_ids] if document_ids else [query])
+            
+            chunks = []
+            for row in cursor:
+                chunks.append({
+                    "chunk_id": row[0],
+                    "document_id": row[1],
+                    "version_id": row[2],
+                    "content_text": row[3],
+                    "metadata": json.loads(row[4]) if row[4] else {},
+                    "document_title": row[5]
+                })
+            
+            return chunks
+        finally:
+            cursor.close()
+    
+    def _group_chunks_by_document(self, chunks: List[Dict]) -> Dict[str, List[Dict]]:
+        """按文档ID分组内容块"""
+        grouped = {}
+        for chunk in chunks:
+            doc_id = chunk["document_id"]
+            if doc_id not in grouped:
+                grouped[doc_id] = []
+            grouped[doc_id].append(chunk)
+        
+        return grouped
+    
+    def _get_document_metadata(self, document_ids: List[str]) -> Dict[str, Dict]:
+        """获取文档元数据"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT DOCUMENT_ID, DOCUMENT_NUMBER, TITLE, 
+                       PUBLISHED_DATE, CATEGORY, STATUS
+                FROM DOCUMENTS
+                WHERE DOCUMENT_ID IN :1
+            """, [list(document_ids)])
+            
+            metadata = {}
+            for row in cursor:
+                metadata[row[0]] = {
+                    "document_number": row[1],
+                    "title": row[2],
+                    "published_date": row[3].isoformat() if row[3] else None,
+                    "category": row[4],
+                    "status": row[5]
+                }
+            
+            return metadata
+        finally:
+            cursor.close()
+    
+    def _perform_llm_analysis(self, query: str, 
+                            grouped_chunks: Dict[str, List[Dict]],
+                            doc_metadata: Dict[str, Dict]]) -> Dict:
+        """使用LLM进行综合分析"""
+        # 准备LLM输入
+        analysis_input = []
+        for doc_id, chunks in grouped_chunks.items():
+            metadata = doc_metadata.get(doc_id, {})
+            analysis_input.append({
+                "document": metadata.get("title", doc_id),
+                "metadata": metadata,
+                "content_samples": [c["content_text"] for c in chunks[:3]]  # 取前3个块作为样本
+            })
+        
+        prompt = f"""
+        请分析以下来自不同文档的内容，回答用户查询并找出文档间的关系。
+        
+        用户查询: {query}
+        
+        文档内容:
+        {json.dumps(analysis_input, indent=2, ensure_ascii=False)}
+        
+        请提供:
+        1. 综合答案(基于所有相关文档)
+        2. 各文档间的异同点
+        3. 潜在的矛盾或不一致之处
+        4. 建议查阅的其他相关内容
+        
+        以JSON格式返回结果:
+        {{
+            "answer": "",
+            "comparisons": [],
+            "inconsistencies": [],
+            "recommendations": []
+        }}
+        """
+        
+        response = self.generative_model.generate_content(prompt)
+        
+        try:
+            result = json.loads(response.text)
+            result["source_documents"] = doc_metadata
+            return result
+        except json.JSONDecodeError:
+            return {
+                "error": "Failed to parse analysis result",
+                "raw_response": response.text
+            }
+    
+    def _get_versions_in_date_range(self, date_range: Dict[str, datetime],
+                                 category: str = None) -> List[Dict]:
+        """获取时间范围内的文档版本"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            query = """
+                SELECT v.VERSION_ID, v.DOCUMENT_ID, v.VERSION_NUMBER,
+                       v.EFFECTIVE_DATE, v.CHANGE_DESCRIPTION,
+                       d.TITLE, d.CATEGORY, d.STATUS
+                FROM DOCUMENT_VERSIONS v
+                JOIN DOCUMENTS d ON v.DOCUMENT_ID = d.DOCUMENT_ID
+                WHERE v.EFFECTIVE_DATE BETWEEN :1 AND :2
+            """
+            
+            params = [date_range["start"], date_range["end"]]
+            
+            if category:
+                query += " AND d.CATEGORY = :3"
+                params.append(category)
+            
+            cursor.execute(query, params)
+            
+            versions = []
+            for row in cursor:
+                versions.append({
+                    "version_id": row[0],
+                    "document_id": row[1],
+                    "version_number": row[2],
+                    "effective_date": row[3],
+                    "change_description": row[4],
+                    "title": row[5],
+                    "category": row[6],
+                    "status": row[7]
+                })
+            
+            return versions
+        finally:
+            cursor.close()
+    
+    def _analyze_version_impact(self, version: Dict) -> TemporalAnalysisResult:
+        """分析单个版本的影响"""
+        # 使用LLM评估变更影响
+        prompt = f"""
+        分析以下文档版本的变更影响:
+        
+        文档标题: {version["title"]}
+        版本号: {version["version_number"]}
+        生效日期: {version["effective_date"]}
+        变更描述: {version["change_description"] or "无"}
+        
+        请评估:
+        1. 变更影响程度(1-10分)
+        2. 受影响的主要领域
+        3. 预计下一次更新的时间
+        
+        以JSON格式返回结果:
+        {{
+            "impact_score": 0,
+            "affected_areas": [],
+            "predicted_expiry": ""
+        }}
+        """
+        
+        response = self.generative_model.generate_content(prompt)
+        
+        try:
+            analysis = json.loads(response.text)
+            
+            return TemporalAnalysisResult(
+                document_id=version["document_id"],
+                document_title=version["title"],
+                version_number=version["version_number"],
+                effective_date=version["effective_date"],
+                change_description=version["change_description"],
+                impact_score=analysis.get("impact_score", 5),
+                affected_areas=analysis.get("affected_areas", []),
+                predicted_expiry=datetime.fromisoformat(analysis["predicted_expiry"]) 
+                               if analysis.get("predicted_expiry") else None
+            )
+        except:
+            return TemporalAnalysisResult(
+                document_id=version["document_id"],
+                document_title=version["title"],
+                version_number=version["version_number"],
+                effective_date=version["effective_date"],
+                change_description=version["change_description"],
+                impact_score=5,
+                affected_areas=[],
+                predicted_expiry=None
+            )
+    
+    def _analyze_trends(self, results: List[TemporalAnalysisResult],
+                       date_range: Dict[str, datetime]) -> Dict:
+        """分析整体趋势"""
+        # 按类别分组
+        by_category = {}
+        for result in results:
+            if result.category not in by_category:
+                by_category[result.category] = []
+            by_category[result.category].append(result)
+        
+        # 计算平均影响分数
+        trend_analysis = {
+            "total_versions": len(results),
+            "categories": {},
+            "time_series": {}
+        }
+        
+        # 按类别分析
+        for category, items in by_category.items():
+            avg_score = sum(r.impact_score for r in items) / len(items)
+            trend_analysis["categories"][category] = {
+                "count": len(items),
+                "average_impact": avg_score,
+                "most_affected_areas": self._get_common_areas(items)
+            }
+        
+        # 按时间序列分析
+        current_date = date_range["start"]
+        while current_date <= date_range["end"]:
+            next_date = current_date + timedelta(days=30)  # 按月分组
+            period_versions = [
+                r for r in results 
+                if r.effective_date and current_date <= r.effective_date < next_date
+            ]
+            
+            if period_versions:
+                avg_score = sum(r.impact_score for r in period_versions) / len(period_versions)
+                trend_analysis["time_series"][current_date.strftime("%Y-%m")] = {
+                    "count": len(period_versions),
+                    "average_impact": avg_score
+                }
+            
+            current_date = next_date
+        
+        return trend_analysis
+    
+    def _get_common_areas(self, results: List[TemporalAnalysisResult]) -> List[str]:
+        """获取最常见的受影响领域"""
+        area_counts = {}
+        for result in results:
+            for area in result.affected_areas:
+                area_counts[area] = area_counts.get(area, 0) + 1
+        
+        sorted_areas = sorted(area_counts.items(), key=lambda x: x[1], reverse=True)
+        return [area for area, count in sorted_areas[:3]]  # 返回前3个
+    
+    def _get_version_chunks(self, document_id: str, version_id: str) -> List[Dict]:
+        """获取特定版本的内容块"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            cursor.execute("""
+                SELECT CHUNK_ID, CHUNK_NUMBER, CONTENT_TYPE, 
+                       CONTENT_TEXT, METADATA
+                FROM DOCUMENT_CHUNKS
+                WHERE DOCUMENT_ID = :1 AND VERSION_ID = :2
+                ORDER BY CHUNK_NUMBER
+            """, [document_id, version_id])
+            
+            chunks = []
+            for row in cursor:
+                chunks.append({
+                    "chunk_id": row[0],
+                    "chunk_number": row[1],
+                    "content_type": row[2],
+                    "content_text": row[3],
+                    "metadata": json.loads(row[4]) if row[4] else {}
+                })
+            
+            return chunks
+        finally:
+            cursor.close()
+    
+    def _generate_diff_report(self, chunks_v1: List[Dict], chunks_v2: List[Dict]]) -> Dict:
+        """生成差异报告"""
+        # 准备LLM输入
+        input_v1 = "\n".join([f"Chunk {c['chunk_number']}: {c['content_text'][:500]}" 
+                             for c in chunks_v1[:5]])  # 取前5个块
+        input_v2 = "\n".join([f"Chunk {c['chunk_number']}: {c['content_text'][:500]}" 
+                             for c in chunks_v2[:5]])
+        
+        prompt = f"""
+        比较以下两个文档版本的内容差异:
+        
+        版本1内容:
+        {input_v1}
+        
+        版本2内容:
+        {input_v2}
+        
+        请分析:
+        1. 主要变更内容
+        2. 新增或删除的部分
+        3. 潜在的业务影响
+        4. 需要特别注意的变更
+        
+        以JSON格式返回结果:
+        {{
+            "major_changes": [],
+            "added_sections": [],
+            "removed_sections": [],
+            "business_impact": "",
+            "critical_changes": []
+        }}
+        """
+        
+        response = self.generative_model.generate_content(prompt)
+        
+        try:
+            return json.loads(response.text)
+        except json.JSONDecodeError:
+            return {
+                "error": "Failed to parse diff report",
+                "raw_response": response.text
+            }
