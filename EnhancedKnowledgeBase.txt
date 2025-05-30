@@ -1,0 +1,546 @@
+import os
+from datetime import datetime
+from typing import List, Dict, Optional
+from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, UnstructuredFileLoader
+from langchain_community.vectorstores import FAISS
+from vertex_connector import VertexAIConnector
+from oracledb import Connection
+import json
+from dataclasses import dataclass, asdict
+
+@dataclass
+class DocumentChunk:
+    chunk_id: str
+    document_id: str
+    version_id: str
+    chunk_number: int
+    content_type: str
+    content_text: str
+    metadata: dict
+    start_page: Optional[int] = None
+    end_page: Optional[int] = None
+    is_manually_adjusted: bool = False
+    important_keywords: List[str] = None
+
+class EnhancedKnowledgeBase:
+    """增强版知识库管理系统"""
+    
+    def __init__(self, db_conn: Connection = None):
+        self.config = Config()
+        self.connector = VertexAIConnector()
+        self.embedding_model = self.connector.get_embedding_model()
+        self.db_conn = db_conn
+        self.generative_model = self.connector.get_generative_model()
+        
+        # 动态分块配置
+        self.chunking_strategies = {
+            'default': {
+                'chunk_size': 1500,
+                'chunk_overlap': 300,
+                'separators': ["\n\n", "\n", "。", " ", ""]
+            },
+            'table': {
+                'chunk_size': 2000,
+                'chunk_overlap': 100,
+                'keep_separator': True
+            },
+            'header': {
+                'chunk_size': 500,
+                'chunk_overlap': 50
+            }
+        }
+    
+    def _load_document(self, file_path: str):
+        """智能文档加载，保留更多元数据"""
+        file_ext = os.path.splitext(file_path)[1].lower()
+        
+        if file_ext == '.pdf':
+            loader = PyPDFLoader(file_path)
+            docs = loader.load()
+            for doc in docs:
+                doc.metadata['content_type'] = 'text'  # 默认类型
+                if 'page' in doc.metadata:
+                    doc.metadata['start_page'] = doc.metadata['page']
+                    doc.metadata['end_page'] = doc.metadata['page']
+        elif file_ext in ('.docx', '.doc'):
+            loader = Docx2txtLoader(file_path)
+            docs = loader.load()
+            for doc in docs:
+                doc.metadata['content_type'] = 'text'
+        else:
+            loader = UnstructuredFileLoader(file_path)
+            docs = loader.load()
+        
+        return docs
+    
+    def _smart_chunking(self, documents: List[Document]) -> List[DocumentChunk]:
+        """智能分块策略"""
+        chunks = []
+        
+        for doc in documents:
+            content_type = doc.metadata.get('content_type', 'text')
+            strategy = self.chunking_strategies.get(content_type, self.chunking_strategies['default'])
+            
+            # 根据内容类型应用不同分块策略
+            if content_type == 'table':
+                # 表格保持完整不分块
+                chunk = DocumentChunk(
+                    chunk_id=str(uuid.uuid4()),
+                    document_id=doc.metadata.get('document_id', ''),
+                    version_id=doc.metadata.get('version_id', ''),
+                    chunk_number=0,
+                    content_type='table',
+                    content_text=doc.page_content,
+                    metadata=doc.metadata,
+                    start_page=doc.metadata.get('start_page', 0),
+                    end_page=doc.metadata.get('end_page', 0)
+                )
+                chunks.append(chunk)
+            else:
+                # 普通文本使用递归分块
+                text_splitter = RecursiveCharacterTextSplitter(**strategy)
+                splits = text_splitter.split_documents([doc])
+                
+                for i, split in enumerate(splits):
+                    chunk = DocumentChunk(
+                        chunk_id=str(uuid.uuid4()),
+                        document_id=split.metadata.get('document_id', ''),
+                        version_id=split.metadata.get('version_id', ''),
+                        chunk_number=i,
+                        content_type=content_type,
+                        content_text=split.page_content,
+                        metadata=split.metadata,
+                        start_page=split.metadata.get('start_page', 0),
+                        end_page=split.metadata.get('end_page', 0)
+                    )
+                    chunks.append(chunk)
+        
+        return chunks
+    
+    def process_document(self, file_path: str, document_id: str, version_id: str, manual_review: bool = False):
+        """处理单个文档并保存到数据库和向量库"""
+        # 1. 加载文档
+        raw_docs = self._load_document(file_path)
+        
+        # 添加文档元数据
+        for doc in raw_docs:
+            doc.metadata.update({
+                'document_id': document_id,
+                'version_id': version_id,
+                'processing_date': datetime.now().isoformat()
+            })
+        
+        # 2. 智能分块
+        chunks = self._smart_chunking(raw_docs)
+        
+        # 3. 保存到Oracle数据库
+        if self.db_conn:
+            self._save_chunks_to_db(chunks)
+        
+        # 4. 生成嵌入向量
+        texts = [chunk.content_text for chunk in chunks]
+        metadatas = [asdict(chunk) for chunk in chunks]
+        
+        embeddings = self.embedding_model.get_embeddings(texts)
+        vectors = [embedding.values for embedding in embeddings]
+        
+        # 5. 更新FAISS索引
+        if os.path.exists(self.config.VECTOR_STORE_PATH):
+            vectorstore = FAISS.load_local(self.config.VECTOR_STORE_PATH, self.embedding_model)
+            vectorstore.add_embeddings(texts, vectors, metadatas)
+        else:
+            vectorstore = FAISS.from_embeddings(
+                texts=texts,
+                embeddings=vectors,
+                embedding=self.embedding_model,
+                metadatas=metadatas
+            )
+        
+        vectorstore.save_local(self.config.VECTOR_STORE_PATH)
+        
+        # 6. 如果需要人工审核，生成审核任务
+        if manual_review:
+            self._create_review_task(document_id, version_id)
+        
+        return {
+            'document_id': document_id,
+            'version_id': version_id,
+            'chunk_count': len(chunks),
+            'status': 'processed'
+        }
+    
+    def _save_chunks_to_db(self, chunks: List[DocumentChunk]):
+        """保存内容块到Oracle数据库"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            for chunk in chunks:
+                cursor.execute("""
+                    INSERT INTO DOCUMENT_CHUNKS (
+                        CHUNK_ID, DOCUMENT_ID, VERSION_ID, CHUNK_NUMBER,
+                        CONTENT_TYPE, CONTENT_TEXT, METADATA, CREATED_AT
+                    ) VALUES (
+                        :1, :2, :3, :4, :5, :6, :7, SYSTIMESTAMP
+                    )
+                """, [
+                    chunk.chunk_id,
+                    chunk.document_id,
+                    chunk.version_id,
+                    chunk.chunk_number,
+                    chunk.content_type,
+                    chunk.content_text,
+                    json.dumps(chunk.metadata)
+                ])
+            
+            self.db_conn.commit()
+        except Exception as e:
+            self.db_conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+    
+    def _create_review_task(self, document_id: str, version_id: str):
+        """创建人工审核任务"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            cursor.execute("""
+                INSERT INTO DOCUMENT_REVIEWS (
+                    REVIEW_ID, DOCUMENT_ID, VERSION_ID,
+                    REVIEW_STATUS, REVIEWER_ID, CREATED_AT
+                ) VALUES (
+                    :1, :2, :3, 'PENDING', NULL, SYSTIMESTAMP
+                )
+            """, [str(uuid.uuid4()), document_id, version_id])
+            
+            self.db_conn.commit()
+        except Exception as e:
+            self.db_conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+    
+    def get_vector_store(self):
+        """获取向量存储实例"""
+        return FAISS.load_local(
+            self.config.VECTOR_STORE_PATH,
+            self.embedding_model
+        )
+    
+    def auto_tag_documents(self, document_ids: List[str] = None):
+        """使用LLM自动生成文档标签"""
+        # 获取需要标记的文档内容
+        query = """
+            SELECT d.DOCUMENT_ID, d.TITLE, c.CONTENT_TEXT 
+            FROM DOCUMENTS d
+            JOIN DOCUMENT_CHUNKS c ON d.DOCUMENT_ID = c.DOCUMENT_ID
+            WHERE c.VERSION_ID = (
+                SELECT MAX(VERSION_ID) 
+                FROM DOCUMENT_VERSIONS 
+                WHERE DOCUMENT_ID = d.DOCUMENT_ID
+            )
+        """
+        
+        if document_ids:
+            query += " AND d.DOCUMENT_ID IN :document_ids"
+        
+        cursor = self.db_conn.cursor()
+        cursor.execute(query, document_ids if document_ids else None)
+        results = cursor.fetchall()
+        cursor.close()
+        
+        # 按文档分组内容
+        docs_content = {}
+        for doc_id, title, content in results:
+            if doc_id not in docs_content:
+                docs_content[doc_id] = {
+                    'title': title,
+                    'content': []
+                }
+            docs_content[doc_id]['content'].append(content[:1000])  # 限制每块内容长度
+        
+        # 使用LLM生成标签
+        generated_tags = {}
+        for doc_id, data in docs_content.items():
+            content_samples = "\n\n".join(data['content'][:3])  # 取前3块作为样本
+            prompt = f"""
+            根据以下文档内容和标题，生成5-10个最相关的标签。
+            考虑文档的主题、类别、涉及的技术和业务领域。
+            
+            标题: {data['title']}
+            内容样本:
+            {content_samples}
+            
+            请以JSON格式返回结果，包含tags数组:
+            {{
+                "tags": ["tag1", "tag2", ...]
+            }}
+            """
+            
+            response = self.generative_model.generate_content(prompt)
+            
+            try:
+                tags = json.loads(response.text)['tags']
+                generated_tags[doc_id] = tags
+            except:
+                generated_tags[doc_id] = []
+        
+        # 保存标签到数据库
+        cursor = self.db_conn.cursor()
+        try:
+            for doc_id, tags in generated_tags.items():
+                # 更新文档元数据
+                cursor.execute("""
+                    UPDATE DOCUMENTS 
+                    SET METADATA = JSON_MERGEPATCH(
+                        COALESCE(METADATA, '{}'),
+                        JSON_OBJECT('auto_tags' VALUE :1)
+                    WHERE DOCUMENT_ID = :2
+                """, [json.dumps(tags), doc_id])
+            
+            self.db_conn.commit()
+            return generated_tags
+        except Exception as e:
+            self.db_conn.rollback()
+            raise e
+        finally:
+            cursor.close()
+    
+    def cross_document_analysis(self, query: str, top_k: int = 5):
+        """跨文档分析功能"""
+        vectorstore = self.get_vector_store()
+        
+        # 1. 语义搜索相关文档块
+        results = vectorstore.similarity_search(query, k=top_k)
+        
+        # 2. 按文档分组结果
+        doc_results = {}
+        for res in results:
+            doc_id = res.metadata['document_id']
+            if doc_id not in doc_results:
+                doc_results[doc_id] = []
+            doc_results[doc_id].append(res)
+        
+        # 3. 获取文档元数据
+        doc_metadata = {}
+        cursor = self.db_conn.cursor()
+        cursor.execute("""
+            SELECT DOCUMENT_ID, DOCUMENT_NUMBER, TITLE, PUBLISHED_DATE 
+            FROM DOCUMENTS 
+            WHERE DOCUMENT_ID IN :doc_ids
+        """, [list(doc_results.keys())])
+        
+        for row in cursor:
+            doc_metadata[row[0]] = {
+                'document_number': row[1],
+                'title': row[2],
+                'published_date': row[3].isoformat() if row[3] else None
+            }
+        cursor.close()
+        
+        # 4. 使用LLM进行跨文档分析
+        analysis_input = []
+        for doc_id, chunks in doc_results.items():
+            metadata = doc_metadata.get(doc_id, {})
+            analysis_input.append({
+                'document': metadata.get('title', doc_id),
+                'content': "\n".join([c.page_content for c in chunks])
+            })
+        
+        prompt = f"""
+        请分析以下来自不同文档的内容片段，找出它们之间的关系和共同主题。
+        用户查询: {query}
+        
+        文档内容:
+        {json.dumps(analysis_input, indent=2)}
+        
+        请提供:
+        1. 各文档间的关键共同点
+        2. 发现的任何矛盾或不一致之处
+        3. 与用户查询最相关的综合答案
+        4. 建议进一步查阅的相关文档或部分
+        
+        以JSON格式返回结果:
+        {{
+            "common_themes": [],
+            "inconsistencies": [],
+            "answer": "",
+            "recommendations": []
+        }}
+        """
+        
+        response = self.generative_model.generate_content(prompt)
+        
+        try:
+            analysis_result = json.loads(response.text)
+            
+            # 添加文档元数据到结果
+            analysis_result['source_documents'] = doc_metadata
+            return analysis_result
+        except:
+            return {
+                'error': 'Failed to parse analysis result',
+                'raw_response': response.text
+            }
+    
+    def temporal_analysis(self, date_range: Dict[str, str], category: str = None):
+        """时效性分析"""
+        # 1. 查询指定时间范围内的文档
+        query = """
+            SELECT d.DOCUMENT_ID, d.TITLE, d.PUBLISHED_DATE, 
+                   v.VERSION_NUMBER, v.EFFECTIVE_DATE, v.CHANGE_DESCRIPTION
+            FROM DOCUMENTS d
+            JOIN DOCUMENT_VERSIONS v ON d.DOCUMENT_ID = v.DOCUMENT_ID
+            WHERE v.EFFECTIVE_DATE BETWEEN :start_date AND :end_date
+        """
+        
+        params = {
+            'start_date': date_range['start'],
+            'end_date': date_range['end']
+        }
+        
+        if category:
+            query += " AND d.CATEGORY = :category"
+            params['category'] = category
+        
+        cursor = self.db_conn.cursor()
+        cursor.execute(query, params)
+        documents = cursor.fetchall()
+        cursor.close()
+        
+        # 2. 获取文档变更趋势
+        trend_analysis = {}
+        for doc in documents:
+            year = doc[2].year if doc[2] else None
+            if year not in trend_analysis:
+                trend_analysis[year] = 0
+            trend_analysis[year] += 1
+        
+        # 3. 使用LLM分析变更模式
+        docs_sample = documents[:5]  # 取前5个文档作为样本
+        sample_text = "\n".join([
+            f"{doc[1]} (生效日期: {doc[4] if doc[4] else '无'}): {doc[5] or '无变更描述'}"
+            for doc in docs_sample
+        ])
+        
+        prompt = f"""
+        分析以下时间段内文档变更的模式和趋势:
+        时间范围: {date_range['start']} 至 {date_range['end']}
+        文档类别: {category or '所有类别'}
+        
+        文档变更样本:
+        {sample_text}
+        
+        年度变更统计:
+        {json.dumps(trend_analysis, indent=2)}
+        
+        请提供:
+        1. 识别出的主要变更类型
+        2. 变更频率的趋势分析
+        3. 可能触发变更的外部因素
+        4. 对未来变更的预测
+        
+        以JSON格式返回结果:
+        {{
+            "change_patterns": [],
+            "trend_analysis": "",
+            "external_factors": [],
+            "predictions": ""
+        }}
+        """
+        
+        response = self.generative_model.generate_content(prompt)
+        
+        try:
+            analysis_result = json.loads(response.text)
+            analysis_result['document_count'] = len(documents)
+            analysis_result['trend_by_year'] = trend_analysis
+            return analysis_result
+        except:
+            return {
+                'error': 'Failed to parse analysis result',
+                'raw_response': response.text,
+                'document_count': len(documents),
+                'trend_by_year': trend_analysis
+            }
+    
+    def get_document_chunks_for_review(self, document_id: str):
+        """获取文档分块供人工审核"""
+        cursor = self.db_conn.cursor()
+        
+        cursor.execute("""
+            SELECT c.CHUNK_ID, c.CHUNK_NUMBER, c.CONTENT_TYPE, c.CONTENT_TEXT,
+                   c.METADATA, d.TITLE, v.VERSION_NUMBER
+            FROM DOCUMENT_CHUNKS c
+            JOIN DOCUMENTS d ON c.DOCUMENT_ID = d.DOCUMENT_ID
+            JOIN DOCUMENT_VERSIONS v ON c.VERSION_ID = v.VERSION_ID
+            WHERE c.DOCUMENT_ID = :1
+            ORDER BY c.CHUNK_NUMBER
+        """, [document_id])
+        
+        chunks = []
+        for row in cursor:
+            metadata = json.loads(row[4]) if row[4] else {}
+            chunks.append({
+                'chunk_id': row[0],
+                'chunk_number': row[1],
+                'content_type': row[2],
+                'content_text': row[3],
+                'metadata': metadata,
+                'document_title': row[5],
+                'version_number': row[6]
+            })
+        
+        cursor.close()
+        return chunks
+    
+    def update_chunk_after_review(self, chunk_data: Dict):
+        """更新人工审核后的内容块"""
+        cursor = self.db_conn.cursor()
+        
+        try:
+            # 更新块内容
+            cursor.execute("""
+                UPDATE DOCUMENT_CHUNKS
+                SET CONTENT_TEXT = :1,
+                    METADATA = JSON_MERGEPATCH(
+                        COALESCE(METADATA, '{}'),
+                        JSON_OBJECT(
+                            'is_manually_adjusted' VALUE true,
+                            'important_keywords' VALUE :2,
+                            'review_notes' VALUE :3
+                        )
+                    )
+                WHERE CHUNK_ID = :4
+            """, [
+                chunk_data['content_text'],
+                json.dumps(chunk_data.get('important_keywords', [])),
+                chunk_data.get('review_notes', ''),
+                chunk_data['chunk_id']
+            ])
+            
+            # 如果内容有重大变更，可能需要重新生成嵌入向量
+            if chunk_data.get('content_changed', False):
+                new_embedding = self.embedding_model.get_embeddings([chunk_data['content_text']])[0]
+                
+                # 更新向量库
+                vectorstore = self.get_vector_store()
+                vectorstore.update_embedding(
+                    chunk_data['chunk_id'],
+                    new_embedding.values,
+                    {
+                        **chunk_data['metadata'],
+                        'is_manually_adjusted': True,
+                        'important_keywords': chunk_data.get('important_keywords', [])
+                    }
+                )
+                vectorstore.save_local(self.config.VECTOR_STORE_PATH)
+            
+            self.db_conn.commit()
+            return {'status': 'success', 'chunk_id': chunk_data['chunk_id']}
+        except Exception as e:
+            self.db_conn.rollback()
+            raise e
+        finally:
+            cursor.close()
